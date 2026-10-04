@@ -736,6 +736,17 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         async_delegation.maybe_sweep_orphaned_completions(queue)
         if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
             last_bot_poll = now
+            from tools.bot_delivery_outbox import poll_outgoing, sweep_install_outgoing
+            try:
+                poll_outgoing(_session_home(session), _submit_row_target_key(session))
+                sweep_install_outgoing(_session_home(session))
+            except Exception as exc:
+                _notif_log_failure("delivery receipt recovery failed", exc)
+            if session.get("agent") is not None and session.get("queued_prompt") and not session.get("running"):
+                try:
+                    _drain_queued_prompt("__queue_recovery__", sid, session)
+                except Exception as exc:
+                    _notif_log_failure("queued prompt recovery failed", exc)
             _poll_bot_live_delivery_guarded(sid, session, now)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.

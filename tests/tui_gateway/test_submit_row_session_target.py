@@ -351,7 +351,7 @@ def test_busy_queue_accept_row_lands_with_the_turn_and_is_addressed_there(monkey
         assert merged == ["first QUEUED-A\n\nsecond"], f"merge update missed the row's session: {merged}"
 
         # Drain: the accept-time row is re-placed at the end and the early one deactivated.
-        server._replace_queued_user_row_for_turn(session, session["queued_prompt"])
+        server._replace_queued_user_row_for_turn(session, session["queued_prompt"], is_dispatching=True)
         assert len([r for r in _rows(db, child) if "QUEUED-A" in r[1]]) == 2
         active = [r for r in db.get_messages_as_conversation(child, include_row_ids=True)
                   if "QUEUED-A" in str(r["content"])]

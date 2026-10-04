@@ -2,9 +2,9 @@
 active — the next cold resume's alternation repair glues the never-run prompt into the previous
 turn's user message (#125577).
 
-The fix marks the accept-time row (``display_metadata._queued_prompt``) and ``reopen_session``
-deactivates still-marked rows: the drain's replacement row is unmarked, so still-marked after a
-restart == never drained. Rows are deactivated, never deleted, the same marking the drain uses.
+The model projection excludes ``display_metadata._queued_prompt`` BEFORE alternation repair.
+Reopen preserves those rows for display and durable queue recovery; the drain's replacement
+row is unmarked only when admitted. The historical filename is retained for regression links.
 """
 
 import types
@@ -47,7 +47,7 @@ def _accept_busy_prompt_a_concludes(db, sid, key, queued_text="queued prompt B R
     db.append_message(key, "assistant", content="reply A")  # turn A concludes; the drain never runs
 
 
-def test_restart_retires_the_never_drained_accept_row(monkeypatch, tmp_path):
+def test_restart_excludes_but_preserves_the_never_drained_accept_row(monkeypatch, tmp_path):
     """RED for the bug: with the queue gone (restart), nothing retired the accept-time row and the
     repaired projection returned 'prompt A\n\nqueued prompt B' absorbed into turn A's user message."""
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -71,7 +71,7 @@ def test_restart_retires_the_never_drained_accept_row(monkeypatch, tmp_path):
         raw = db.get_messages(key, include_inactive=True)
         assert [(r["role"], r["active"], "RESTART-MARKER" in str(r["content"])) for r in raw] == [
             ("user", 1, False),          # prompt A
-            ("user", 0, True),            # queued prompt B — never drained, retired by reopen
+                ("user", 1, True),            # queued prompt B remains recoverable, excluded from model replay
             ("assistant", 1, False),      # reply A
         ]
     finally:

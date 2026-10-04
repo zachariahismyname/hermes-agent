@@ -250,6 +250,12 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
 
 def _reap_idle_sessions() -> None:
     now = time.time()
+    try:  # Recovery must also run when no chat tile has built an agent yet.
+        from hermes_constants import get_process_hermes_home
+        from tools.bot_delivery_outbox import sweep_install_outgoing
+        sweep_install_outgoing(get_process_hermes_home())
+    except Exception:
+        logger.warning("periodic delivery recovery failed; intents retained", exc_info=True)
     try:  # piggyback the incremental flush on the reaper tick — no new timer subsystem
         _flush_dirty_sessions()
     except Exception:

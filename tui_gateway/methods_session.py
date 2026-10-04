@@ -628,6 +628,8 @@ class _Resume:
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
             profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
+        from hermes_state_queue import pending_prompt_envelopes
+        _ac_set_queue(record, pending_prompt_envelopes(self.db, self.target))
         if follows_profile:
             record.update(
                 follow_profile_config=True,

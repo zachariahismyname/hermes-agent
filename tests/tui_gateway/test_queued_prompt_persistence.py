@@ -36,7 +36,8 @@ def _busy(session, in_flight="prompt A"):
 
 
 def _active_rows(db, key):
-    return db.get_messages_as_conversation(key, repair_alternation=True, include_row_ids=True)
+    # These assertions inspect accept-time DISPLAY persistence, not model eligibility.
+    return db.get_messages_as_conversation(key, repair_alternation=True, include_row_ids=True, include_queued=True)
 
 
 def _flush_agent(db, key):
@@ -139,7 +140,7 @@ def test_queued_prompt_survives_a_backend_restart(monkeypatch, tmp_path):
         try:
             assert any(r["role"] == "user" and "queued text QUEUED-MARKER" in str(r["content"])
                        for r in fresh.get_messages_as_conversation(key, repair_alternation=True,
-                                                                   include_row_ids=True))
+                                                                   include_row_ids=True, include_queued=True))
         finally:
             fresh.close()
     finally:
@@ -168,6 +169,32 @@ def test_merged_queue_text_updates_the_written_row_in_place(monkeypatch, tmp_pat
         db.close()
 
 
+def test_admission_failure_preserves_queue_and_ownership_refusal_does_not_admit(monkeypatch, tmp_path):
+    import hermes_state_queue
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        _busy(session)
+        server._handle_busy_submit("r", sid, session, "retained", None, queued=True)
+        session["running"] = False
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: "another real owner")
+        assert server._drain_queued_prompt("r", sid, session) is False
+        assert session["queued_prompt"]["text"] == "retained"
+        assert len(hermes_state_queue.pending_prompt_envelopes(db, key)) == 1
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
+        def fail(*args):
+            raise RuntimeError("synthetic disk failure")
+        monkeypatch.setattr(hermes_state_queue, "replace_queued_rows", fail)
+        assert server._drain_queued_prompt("r", sid, session) is False
+        assert session["running"] is False
+        assert session["queued_prompt"]["text"] == "retained"
+        assert len(hermes_state_queue.pending_prompt_envelopes(db, key)) == 1
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_cleared_queue_keeps_the_queued_row_as_the_interrupted_shape(monkeypatch, tmp_path):
     """A cancelled queued prompt keeps its trailing user row: a trailing user row with no reply
     is the documented interrupted-transcript shape (never delete it on cancel)."""
@@ -178,10 +205,14 @@ def test_cleared_queue_keeps_the_queued_row_as_the_interrupted_shape(monkeypatch
         _busy(session)
         server._handle_busy_submit("r1", sid, session, "queued text QUEUED-MARKER", "ws-1",
                                    queued=True, display_kind=None)
-        server._ac_set_queue(session, [])  # Stop / queue clear
+        server._cancel_queued_prompts(session)  # Stop / queue clear
         assert not session.get("queued_prompt") and not session.get("queued_prompts")
         rows = _active_rows(db, key)
         assert rows and rows[-1]["role"] == "user" and "queued text QUEUED-MARKER" in str(rows[-1]["content"])
+        from hermes_state_queue import pending_prompt_envelopes
+        db.reopen_session(key)
+        assert pending_prompt_envelopes(db, key) == []
+        assert all("QUEUED-MARKER" not in str(r["content"]) for r in db.get_messages_as_conversation(key))
     finally:
         server._sessions.pop(sid, None)
         db.close()
@@ -239,7 +270,7 @@ def test_partial_drain_never_puts_a_later_prompt_before_an_earlier_one(monkeypat
 def _compact_in_place_while_queued(db, key):
     """The live turn compacts in place: it holds its own rows, never the queued prompt's accept-time
     row, so the commit re-sequences that row to a new id after the compacted set."""
-    held = [r["_row_id"] for r in db.get_messages_as_conversation(key, include_row_ids=True)
+    held = [r["_row_id"] for r in db.get_messages_as_conversation(key, include_row_ids=True, include_queued=True)
             if "QUEUED-MARKER" not in str(r["content"])]
     db.archive_and_compact(key, [{"role": "user", "content": "[CONTEXT COMPACTION] summary of turn A"},
                                  {"role": "assistant", "content": "ok, continuing"}],

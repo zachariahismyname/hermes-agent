@@ -162,6 +162,14 @@ def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str
     Contract shared with the TUI/Desktop surfaces: the FIRST line is the plain user sentence
     (no lease/pid/owner jargon); the second line is ``Details: ...`` for logs and bug reports.
     """
+    metadata = entry.get("metadata") or {}
+    if metadata.get("internal_bot_worker"):
+        sender = str(metadata.get("sender_name") or "a teammate")
+        return (
+            f"Hermes is working on a background assignment from {sender} in this chat. "
+            "Your message was not accepted. Keep your draft and retry here after the work finishes.\n"
+            + session_owner_details(session_id, entry)
+        )
     return (
         "This chat is open in another Hermes window/terminal. Use it there, or start a new chat here.\n"
         + session_owner_details(session_id, entry)

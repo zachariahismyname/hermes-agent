@@ -207,9 +207,16 @@ def _drop_queued_duplicates_of_inflight_user(session: dict) -> None:
     if not (original := _ac_inflight_original(session)):
         return
     head = session.get("queued_prompt")
-    cleaned = (_sanitize_queued_entry_vs_inflight_user(e, original)
-               for e in ([head] if head else []) + list(session.get("queued_prompts") or []))
-    _ac_set_queue(session, [c for c in cleaned if c is not None])
+    cleaned = []
+    for entry in ([head] if head else []) + list(session.get("queued_prompts") or []):
+        value = _sanitize_queued_entry_vs_inflight_user(entry, original)
+        if value is None:
+            _cancel_queued_entries(session, [entry])
+        else:
+            if value is not entry and value.get("_submit_user_row"):
+                _persist_queued_user_row(session, value, value.get("_queued_display_kind"))
+            cleaned.append(value)
+    _ac_set_queue(session, cleaned)
 
 
 def _ac_set_queue(session: dict, entries: list) -> None:
@@ -219,6 +226,33 @@ def _ac_set_queue(session: dict, entries: list) -> None:
         session["queued_prompts"] = entries[1:]
     else:
         session.pop("queued_prompts", None)
+
+
+def _cancel_queued_prompts(session: dict) -> None:
+    """Persist Stop before discarding envelopes, including a racing drain claim."""
+    entries = ([session["queued_prompt"]] if session.get("queued_prompt") else []) + list(session.get("queued_prompts") or [])
+    if session.get("_queued_prompt_claim"):
+        entries.append(session["_queued_prompt_claim"])
+    _cancel_queued_entries(session, entries)
+    _ac_set_queue(session, [])
+
+
+def _cancel_queued_entries(session: dict, entries: list) -> None:
+    requests = []
+    for entry in entries:
+        row = entry.get("_submit_user_row")
+        if isinstance(row, dict) and isinstance(row.get("_row_id"), int):
+            request = (_submit_row_owner_key(row, session), row["_row_id"])
+            if request not in requests:
+                requests.append(request)
+    if requests:
+        from hermes_state_queue import cancel_queued_rows
+        with _session_db(session) as db:
+            if db is None:
+                raise RuntimeError("Cannot cancel queued requests without their durable store")
+            cancel_queued_rows(db, _submit_row_target_key(session), requests)
+    for entry in entries:
+        entry["_cancelled"] = True
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -333,12 +367,13 @@ def _persist_queued_user_row(session: dict, envelope: dict, display_kind: str | 
                 return
             staged["_row_id"], staged["content"] = live_id, envelope["text"]
         return
-    # ``display_metadata`` marker: ``reopen_session`` retires still-marked rows after a restart
-    # discarded the in-memory queue (#125577); the drain's replacement row is unmarked.
+    # Complete envelopes survive restart, but remain outside model history until admission.
     from hermes_state_common import QUEUED_PROMPT_METADATA_KEY
     staged = _write_submit_user_row(
         session, envelope.get("text"), display_kind,
-        accept_metadata={QUEUED_PROMPT_METADATA_KEY: True})
+        accept_metadata={QUEUED_PROMPT_METADATA_KEY: True, "_queue_envelope": {
+            "image_paths": list(envelope.get("image_paths") or []),
+            "turn_author": envelope.get("turn_author")}})
     if staged is not None:
         envelope["_submit_user_row"] = staged
         if display_kind:
@@ -359,39 +394,15 @@ def _replace_queued_user_row_for_turn(session: dict, queued: dict, is_dispatchin
     early = queued.get("_submit_user_row")
     if not (isinstance(early, dict) and isinstance(early.get("_row_id"), int)):
         return None  # no accept-time row (write failed / pre-feature envelope): the turn persists as before
-    # Append the replacement FIRST: if that write fails nothing is deactivated, the accept-time row
-    # stays active (the message stays visible) and the turn's crash persist persists it as before.
-    # The DISPATCHING envelope's replacement carries no marker (its turn adopts the row immediately);
-    # still-queued envelopes keep the never-drained marker (#125577) so a restart between drains
-    # retires the row rather than gluing the never-run prompt into the previous turn.
-    if is_dispatching:
-        _persist_submit_user_row(session, queued.get("text"), queued.get("_queued_display_kind"))
-    else:
-        from hermes_state_common import QUEUED_PROMPT_METADATA_KEY
-        _persist_submit_user_row(session, queued.get("text"), queued.get("_queued_display_kind"),
-                                 accept_metadata={QUEUED_PROMPT_METADATA_KEY: True})
-    fresh = session.get("_submit_user_row")
-    if not (isinstance(fresh, dict) and isinstance(fresh.get("_row_id"), int)):
-        return None  # re-append wrote nothing: keep the accept-time row active
-    queued["_submit_user_row"] = fresh  # the envelope follows the live row (a retry drains cleanly)
+    from hermes_state_queue import replace_queued_row
     with _session_db(session) as db:
         if db is None:
-            return
-        try:
-            # The accept-time dict records the session its row was written under; a rotated-away
-            # ``session_key`` would miss it and leave that row ACTIVE beside its replacement in the
-            # continuation — the [uA, uB, aA] shape this function exists to prevent. An in-place
-            # compaction of the live turn may also have re-sequenced the row to a new id: deactivate
-            # the row that is live NOW, or the clone stays active beside its replacement and the
-            # queued prompt is active twice after the drain (#123675).
-            key = _submit_row_owner_key(early, session)
-            live_id = db.resolve_active_row_id(key, early["_row_id"])
-            if live_id is not None:
-                db.deactivate_message(key, live_id)
-        except Exception:
-            # Both rows briefly active merges in projection but never loses the message; deleting or
-            # losing text would be worse.
-            logger.debug("queued-prompt row re-placement deactivate failed", exc_info=True)
+            raise RuntimeError("Cannot admit a queued request without its durable store")
+        fresh = replace_queued_row(
+            db, _submit_row_owner_key(early, session), _submit_row_target_key(session),
+            early["_row_id"], queued.get("text"), dispatch=is_dispatching)
+    queued["_submit_user_row"] = fresh
+    session["_submit_user_row"] = fresh
     return fresh
 
 
@@ -456,8 +467,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     with _session_turn_admission(session) as admitted:
         if not admitted or session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
             return False
+        if _ensure_active_session_slot(sid, session) is not None:
+            return False  # Another writer owns it: do not pop or mark anything dispatched.
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])
+        session["_queued_prompt_claim"] = queued
         session["running"] = True
         queued_transport = queued.get("transport")
         # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
@@ -473,7 +487,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             # envelope (claimed head first, then whatever advanced into the slot) so a legitimate follow-up isn't dropped.
             # See #84417.
             advanced = session.get("queued_prompt")
-            _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
+            if not queued.get("_cancelled"):
+                _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
+            session.pop("_queued_prompt_claim", None)
             session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
@@ -486,11 +502,30 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     # prompt before the earlier one. Under history_lock so a concurrent submit can't interleave
     # its own row write between the re-append and the deactivation.
     with session["history_lock"]:
-        dispatch_row = _replace_queued_user_row_for_turn(session, queued, is_dispatching=True)
         still_queued = (([session["queued_prompt"]] if session.get("queued_prompt") else [])
                         + list(session.get("queued_prompts") or []))
-        for envelope in still_queued:
-            _replace_queued_user_row_for_turn(session, envelope)
+        durable = [(envelope, envelope.get("_submit_user_row")) for envelope in [queued, *still_queued]
+                   if isinstance(envelope.get("_submit_user_row", {}).get("_row_id"), int)]
+        try:
+            if durable:
+                from hermes_state_queue import replace_queued_rows
+                with _session_db(session) as db:
+                    if db is None:
+                        raise RuntimeError("Cannot admit queued requests without their durable store")
+                    fresh_rows = replace_queued_rows(db, _submit_row_target_key(session), [
+                        (_submit_row_owner_key(row, session), row["_row_id"], envelope["text"], envelope is queued)
+                        for envelope, row in durable])
+                for (envelope, _), fresh in zip(durable, fresh_rows):
+                    envelope["_submit_user_row"] = fresh
+        except Exception as exc:
+            # The whole batch rolled back. Retain order and retry only at a later idle tick.
+            _ac_set_queue(session, [queued, *still_queued])
+            session["running"] = False
+            session.pop("_queued_prompt_claim", None)
+            _notif_log_failure("queued prompt admission failed; request retained", exc)
+            return False
+        dispatch_row = queued.get("_submit_user_row")
+        session.pop("_queued_prompt_claim", None)
         # The single adoption slot must hold the DISPATCHING envelope's row (the loop above leaves
         # the last processed one there) or the turn would adopt the wrong prompt's row.
         if dispatch_row is not None:

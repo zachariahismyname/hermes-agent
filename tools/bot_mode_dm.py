@@ -428,7 +428,8 @@ class _SessionOwnershipRefused(RuntimeError):
     """The CLI explicitly refused before executing the input; safe to enqueue it."""
 
 
-def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
+def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
+                    emit_output: bool = True) -> int:
     """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); re-emits
     the transport's streams and returns its exit code. Transient failures re-run the
     same session; a context_overflow re-run lets the retried turn's pre-API compaction
@@ -445,7 +446,8 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
 
         # The re-run replays the same session and payload; the failed attempt already persisted the
         # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
-        if retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
+        from hermes_cli.quiet_mailbox import DELIVERY_ID_ENV
+        if not (env or {}).get(DELIVERY_ID_ENV) and retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
             proc = _turn(retry_turn_env(env))
     from tools.bot_failure_reasons import session_ownership_refused
 
@@ -461,7 +463,7 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
     if proc.returncode == 0 and is_intentional_silence_response(reply):
         reply = ""
     for stream, text in ((sys.stdout, reply), (sys.stderr, proc.stderr)):
-        if text:
+        if text and emit_output:
             stream.write(text)
             stream.flush()
     return proc.returncode
@@ -479,7 +481,7 @@ def _dm_delivery_id(dm_file: "str | os.PathLike") -> str:
 
 
 def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None,
-                   *, include_busy_owner: bool = False) -> dict | None:
+                   *, include_busy_owner: bool = False, admit_ownerless: bool = False) -> dict | None:
     """Pin intent before admission; retries may inspect, never change transport."""
     from tools.bot_live_delivery import deliver_to_live_owner, find_canonical_live_owner, read_delivery_result
     from utils import fsync_directory
@@ -498,6 +500,9 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
             if busy:
                 owner = {key: busy[key] for key in ('profile_home', 'session_id', 'lease_id')}
                 owner['live_session_id'] = (busy.get('metadata') or {}).get('live_session_id') or 'deferred-cli'
+        if owner is None and admit_ownerless:
+            from tools.bot_mailbox_recovery import canonical_unowned_target
+            owner = canonical_unowned_target(profile_home)
         if owner is None:
             return None
         intent = dict(owner=owner, message=Path(dm_file).read_text(encoding="utf-8-sig"),
@@ -521,10 +526,20 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     return record
 
 
-def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | None" = None) -> int:
+def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | None" = None,
+                  argv: list[str] | None = None, author: Optional[dict] = None) -> int:
     from tools.bot_live_delivery import await_delivery
 
-    record = await_delivery(home, delivery_id, _LIVE_WAIT_SECONDS)
+    from tools.bot_live_delivery import read_delivery_result
+    from tools.bot_mailbox_recovery import recover_without_owner
+    deadline = time.monotonic() + _LIVE_WAIT_SECONDS
+    while True:
+        record = read_delivery_result(home, delivery_id)
+        if record and record["status"] == "queued" and argv is not None and dm_file is not None:
+            recover_without_owner(home, delivery_id, argv, str(dm_file), author=author)
+        record = await_delivery(home, delivery_id, min(0.5, max(deadline - time.monotonic(), 0)))
+        if not record or record["status"] not in ("queued", "claimed") or time.monotonic() >= deadline:
+            break
     status = record["status"] if record else "ambiguous"
     payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
     payload.update(status=status, delivery_id=delivery_id)
@@ -601,7 +616,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 print(_live_outcome_unknown(dm_file, exc))
                 return 1
             if record is not None:
-                return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+                return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file, argv=argv, author=author)
     consumed = False
     try:
         from utils import atomic_json_write
@@ -634,7 +649,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 consumed = result == 0
                 return result
         # Never hold the CLI delivery lock while waiting for the live consumer.
-        return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+        return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file, argv=argv, author=author)
     except Exception as exc:
         from tools.bot_relay import TurnBusyError
 
@@ -642,7 +657,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
             raise
         record = _admit_live_dm(home, dm_file, author, include_busy_owner=True) if home is not None else None
         if record is not None:
-            return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+            return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file, argv=argv, author=author)
         print(json.dumps({'status': 'not_delivered', 'reason': 'target_busy',
                           'delivery_id': _dm_delivery_id(dm_file), 'evidence_file': dm_file,
                           'error': 'Another turn held the target session. Payload retained; no turn executed.'}))
@@ -679,14 +694,24 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
     dm_file = _write_dm_file(content)
     if profile_home is not None:
         try:
-            record = _admit_live_dm(profile_home, dm_file, author)
+            record = _admit_live_dm(profile_home, dm_file, author, include_busy_owner=True, admit_ownerless=True)
         except Exception as exc:
             return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
                 "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
                 "evidence_file": dm_file})
         if record is not None:
+            from tools.bot_delivery_outbox import register_outgoing
+            try:
+                durable_reply = register_outgoing(agent, record, argv, dm_file, author)
+            except Exception as exc:
+                # Recipient admission may already have caused effects. Never turn
+                # a sender-index failure into permission to send a second ticket.
+                return json.dumps(dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
+                    notification_error=str(exc), evidence_file=dm_file,
+                    detail="Recipient admission is retained, but reply tracking failed. Do not resend; inspect this delivery ID."))
             command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
-            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent))
+            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent,
+                                                      durable_reply=durable_reply))
             result = dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
                           detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn.")
             if notification.get("error"):
@@ -708,7 +733,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
 
 
 def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, delivery_id: Optional[str] = None,
-                    task_id: Optional[str], agent: Any) -> str:
+                    task_id: Optional[str], agent: Any, durable_reply: bool = False) -> str:
     """Launch the cleanup-owning runner and transfer file ownership on ack. ``dm_file``
     is None for relay deliveries (the waiter watches a reply file; envelope artifacts
     are owned/swept by ``tools/bot_relay.py``), which pass the envelope id as ``delivery_id``
@@ -718,7 +743,7 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
     try:
         from tools.terminal_tool import terminal_tool
 
-        raw = terminal_tool(command, background=True, notify_on_complete=True, task_id=task_id,
+        raw = terminal_tool(command, background=True, notify_on_complete=not durable_reply, task_id=task_id,
                             workdir=str(Path(__file__).resolve().parent.parent), _host_local=True,
                             _completion_output_chars=REPLY_COMPLETION_CHARS)
         try:
@@ -738,7 +763,9 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From here the background runner owns the file (removed after the consumer finishes).
         transferred = True
-        if parsed.get("notify_on_complete") is False:
+        if durable_reply:
+            detail = "Durably queued. Finish your turn; the recipient receipt will arrive separately. Do not resend."
+        elif parsed.get("notify_on_complete") is False:
             # terminal_tool refused the completion promise: this session (api_server, one-shot
             # runner) cannot receive an async completion, so the recipient's reply would never
             # be injected here (#101142). Say so and name the return path the surface supports.
@@ -761,7 +788,7 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
             "status": "queued",
             "delivery_id": delivery_id or (_dm_delivery_id(dm_file) if dm_file else ""),
             "to": label,
-            "reply_delivery": "poll" if parsed.get("notify_on_complete") is False else "notification",
+            "reply_delivery": "poll" if not durable_reply and parsed.get("notify_on_complete") is False else "notification",
             "detail": detail,
             "process_id": proc_id,
             "queued_at": int(time.time()),

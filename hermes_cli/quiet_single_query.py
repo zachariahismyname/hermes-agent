@@ -211,6 +211,8 @@ def continue_quiet_notify_completions(
     owns_event=None,
     max_rounds: int = _MAX_QUIET_NOTIFY_ROUNDS,
     linger_budget: float | None = None,
+    idle_work=None,
+    has_pending=None,
 ) -> Any:
     """Linger for ``notify_on_complete`` work, then run owned completion texts as follow-up turns.
 
@@ -228,8 +230,17 @@ def continue_quiet_notify_completions(
     if linger_budget is None:
         linger_budget = quiet_notify_linger_seconds()
     deadline = time.monotonic() + max(float(linger_budget), 0.0)
-    for _ in range(max_rounds):
-        wait = process_registry.wait_for_pending_completions(None, timeout=max(deadline - time.monotonic(), 0.0))
+    rounds = 0
+    while rounds < max_rounds:
+        idle_result = idle_work() if idle_work is not None else None
+        if idle_result:
+            rounds += 1
+            if isinstance(idle_result, dict):
+                last = idle_result
+            continue
+        remaining = max(deadline - time.monotonic(), 0.0)
+        wait = process_registry.wait_for_pending_completions(
+            None, timeout=min(remaining, 0.5) if idle_work is not None else remaining)
         drained = []
         for event, text in process_registry.drain_notifications(session_key=key, owns_event=owns_event):
             # Durable async_delegation events carry a delivery ledger: without the
@@ -247,15 +258,21 @@ def continue_quiet_notify_completions(
         # async_delegation results. Keep everything that rendered.
         texts = [text for _event, text in drained if text]
         if texts:
+            rounds += 1
             follow = run_turn("\n\n".join(texts))
             # Same admission rule as the interactive CLI turn: a wake made ONLY of automatic
             # diagnostics (early failure / watch notices) still runs, but under suppression its
             # reply never displaces the requested one-shot answer on stdout.
             if not _diagnostic_only_wake_muted([event for event, text in drained if text]):
                 last = follow
+        if wait.get("timed_out") and idle_work is not None and time.monotonic() < deadline:
+            continue
         if wait.get("timed_out"):
             break
         if not texts:
+            if has_pending is not None and has_pending() and time.monotonic() < deadline:
+                time.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
+                continue
             return last
     return last
 
