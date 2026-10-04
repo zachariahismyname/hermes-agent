@@ -190,7 +190,7 @@ def test_waiter_is_a_runner_entrypoint_the_approval_gate_lets_through(root):
 
     assert detect_dangerous_command(cmd)[0] is False, cmd
     assert parts[1].endswith("bot_mode_dm.py") and parts[2] == "--wait-reply"
-    assert parts[3] == str(bot_relay.relay_root(root) / bot_relay.REPLIES_DIR / f"{'b' * 32}.json")
+    assert Path(parts[3]) == bot_relay.relay_root(root) / bot_relay.REPLIES_DIR / f"{'b' * 32}.json"
     assert parts[4:] == ["@researcher on ssh-vps", str(bot_relay.REPLY_WAIT_SECONDS)]
 
 
