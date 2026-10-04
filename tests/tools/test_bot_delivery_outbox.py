@@ -127,3 +127,30 @@ def test_lost_claim_reports_uncertainty_once_without_replay_or_hiding_late_resul
         assert len(messages) == 2 and "late original result" in messages[1]
     finally:
         la.release(); lb.release(); dba.close(); dbb.close()
+
+
+def test_an_unreadable_index_keeps_the_sender_waiting_for_its_receipt(tmp_path, monkeypatch):
+    """A scan that could not read an index is not proof that nothing is pending: the quiet worker
+    must keep waiting (within its deadline) instead of exiting before the receipt is consumed."""
+    from pathlib import Path
+
+    a, b = tmp_path / "profiles/a", tmp_path / "profiles/b"
+    dba, la, ca = seed(a)
+    dbb, lb, cb = seed(b)
+    try:
+        QuietMailbox(cb, None)
+        original = mailbox.deliver_to_live_owner(b, mailbox.find_canonical_live_owner(b), "question")
+        assert register_outgoing(SimpleNamespace(_session_db=dba, session_id="chat"), original,
+                                 ["hermes", "-p", "b"], tmp_path / "payload.txt", None)
+        index = a / "runtime/bot_delivery_outbox" / (original["id"] + ".json")
+        real_read_text = Path.read_text
+
+        def contended(self, *args, **kwargs):
+            if self == index:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", contended)
+        assert has_pending_outgoing(a, "chat")
+    finally:
+        la.release(); lb.release(); dba.close(); dbb.close()

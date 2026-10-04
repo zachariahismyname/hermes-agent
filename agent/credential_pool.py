@@ -1557,7 +1557,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 # rotates the chain under the other processes holding it.
                 pooled = self._sync_entry_from_pool_store(entry)
                 synced = self._sync_entry_from_auth_store(pooled, require_newer=pooled is not entry)
-                if synced is not entry and not self._entry_needs_refresh(synced):
+                # A forced refresh is skipped only for a NEW bearer: a singleton holding just a rotated
+                # refresh token is adopted with the old, rejected access token, which must still POST.
+                adopted_new_bearer = synced.access_token != entry.access_token
+                if synced is not entry and not self._entry_needs_refresh(synced) and (adopted_new_bearer or not force):
                     return synced
                 return self._refresh_entry_impl(synced, force=force, singleton_synced=True)
             synced = self._sync_entry_from_pool_store(entry)

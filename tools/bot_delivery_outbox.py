@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 RECEIPT_AUTHOR = {"id": "bot:__delivery_receipt__", "name": "Hermes delivery receipt", "is_bot": True}
 
 
-def _indexes(paths):
+def _indexes(paths, unreadable=None):
+    """Readable sender indexes; a path that failed to read is appended to ``unreadable`` when given."""
     for path in paths:
         # Recovery transport sidecars share this directory and may disappear
         # while the child consumes them. They are not durable sender indexes.
@@ -38,6 +39,8 @@ def _indexes(paths):
                 yield path, record
         except (ValueError, OSError):
             logger.warning("Unreadable delivery index retained: %s", path, exc_info=True)
+            if unreadable is not None:
+                unreadable.append(path)
 
 
 @contextlib.contextmanager
@@ -275,12 +278,18 @@ def has_pending_outgoing(home, session_id):
     if not paths:
         return False
     db = SessionDB(db_path=home / "state.db", read_only=True)
+    unreadable = []
     try:
-        return any(not record.get("receipt_queued") and not record.get("uncertainty_queued")
-                   and db.get_compression_tip(record["sender_session"]) == session_id
-                   for _, record in _indexes(paths))
+        if any(not record.get("receipt_queued") and not record.get("uncertainty_queued")
+               and db.get_compression_tip(record["sender_session"]) == session_id
+               for _, record in _indexes(paths, unreadable)):
+            return True
     finally:
         db.close()
+    # An index skipped as unreadable (e.g. a Windows read racing its atomic replace) may be this
+    # session's: report pending so the quiet worker keeps waiting within its own deadline instead of
+    # exiting before the receipt arrives. An empty scan is proof; an incomplete one is not.
+    return bool(unreadable)
 
 
 def sweep_install_outgoing(profile_home):

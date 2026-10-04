@@ -80,3 +80,23 @@ def test_second_process_adopts_a_peer_rotation_instead_of_replaying_the_consumed
     assert adopted.refresh_token in live and adopted.access_token == rotated.access_token
     on_disk = next(r for r in A.read_credential_pool(PROVIDER) if r.get("id") == "codex-1")
     assert on_disk["refresh_token"] in live
+
+
+def test_forced_refresh_never_returns_the_rejected_bearer_when_only_the_refresh_token_moved(token_endpoint):
+    # A device_code row follows the singleton. When the singleton holds only a rotated refresh token,
+    # the sync keeps the row's old access token — the one that just returned 401. Skipping the forced
+    # POST there would hand the rejected bearer straight back.
+    token_endpoint["live"] = {"refresh-1"}
+    with A._auth_store_lock():
+        store = A._load_auth_store()
+        A._save_provider_state(store, PROVIDER, {"tokens": {"refresh_token": "refresh-1"},
+                                                 "last_refresh": "2026-10-04T00:00:01Z"})
+        A._save_auth_store(store)
+    row = _row(0)
+    row.source = "device_code"
+    A.write_credential_pool(PROVIDER, [row.to_dict()])
+
+    refreshed = CredentialPool(PROVIDER, [row]).try_refresh_matching(credential_id="codex-1")
+
+    assert refreshed is not None and refreshed.access_token != _jwt(0)
+    assert token_endpoint["presented"] == ["refresh-1"]
