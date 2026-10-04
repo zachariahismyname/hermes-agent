@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 
 # Internal per-invocation transport token, consumed before any tool can inherit it.
@@ -45,32 +46,61 @@ class QuietMailbox:
 
     def drain_one(self, run_turn):
         from tools.bot_live_delivery import claim_pending_delivery, complete_delivery
+        from tools.bot_receipt_policy import MAX_PASSIVE_PER_PASS, settle_passive_receipt, silence_reason
 
         owner = self.advertise()
         if owner is None:
             return False
         from tools.bot_delivery_outbox import poll_outgoing
         poll_outgoing(self.home, owner["session_id"])
-        record = claim_pending_delivery(self.home, owner, recover_unclaimed=True)
-        if record is None:
-            return False
+        # Status-only receipts are not turns: settle a run of them in this one pass
+        # instead of spending a notify round (or a poll interval) on each.
+        settled = 0
+        while True:
+            record = claim_pending_delivery(self.home, owner, recover_unclaimed=True)
+            if record is None:
+                return settled > 0
+            if (original_id := settle_passive_receipt(self.home, record)) is None:
+                break
+            logging.getLogger(__name__).info(
+                "Delivery %s completed without a reply; status note deferred to the next turn", original_id)
+            self.last_result = None
+            settled += 1
+            if settled >= MAX_PASSIVE_PER_PASS:
+                return True
         if self.internal and record.get("author"):
             self.sender = record["author"].get("name")
             self.advertise()
         try:
             result = run_turn(record["message"], record.get("author"))
-        except BaseException:
+        except BaseException as exc:
             # A turn may already have performed effects. Retain the claim for
             # reconciliation; an exception is never permission to rerun it.
+            logging.getLogger(__name__).warning(
+                "Bot delivery interrupted: id=%s session=%s lease=%s pid=%s exception=%s; claim retained",
+                record["delivery_id"], owner["session_id"], owner["lease_id"], os.getpid(), type(exc).__name__)
             raise
         failed = (not isinstance(result, dict) or result.get("failed") or result.get("partial")
                   or result.get("error") or result.get("interrupted") or result.get("completed") is False)
+        reply = str(result.get("final_response") or "") if isinstance(result, dict) and not failed else ""
         complete_delivery(self.home, record["delivery_id"],
-                          status="failed" if failed else "settled",
-                          reply=str(result.get("final_response") or "") if isinstance(result, dict) and not failed else "",
-                          error=str(result.get("error") or "") if isinstance(result, dict) else "No turn result")
+                          status="failed" if failed else "settled", reply=reply,
+                          error=str(result.get("error") or "") if isinstance(result, dict) else "No turn result",
+                          reason="" if failed else silence_reason(reply))
         self.last_result = result
         return True
+
+    def with_status_note(self, text, run_kwargs):
+        """Model input carrying deferred delivery-status notes; the stored user row stays ``text``."""
+        from tools.bot_receipt_policy import take_status_note
+
+        if self.home is None or not isinstance(text, str):
+            return text
+        note = take_status_note(self.home, getattr(self.cli, "session_id", None))
+        if not note:
+            return text
+        run_kwargs.setdefault("persist_user_message", text)
+        return f"{note}\n\n{text}"
 
     def has_pending(self):
         from tools.bot_delivery_outbox import has_pending_outgoing

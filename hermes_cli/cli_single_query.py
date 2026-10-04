@@ -220,14 +220,17 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 def _recover(text, sender):
                     nonlocal recovered
                     kwargs = {"turn_author": sender} if sender and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+                    text = mailbox.with_status_note(text, kwargs)
                     recovered = cli.agent.run_conversation(
                         user_message=text, conversation_history=cli.conversation_history, **kwargs)
                     return recovered
                 mailbox.drain_one(_recover)
                 result = recovered or {"final_response": "", "messages": cli.conversation_history}
             else:
+                run_kwargs = dict(author_kwargs)
                 result = cli.agent.run_conversation(
-                    user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
+                    user_message=mailbox.with_status_note(effective_query, run_kwargs),
+                    conversation_history=cli.conversation_history, **run_kwargs,
                 )
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
@@ -260,7 +263,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 # the bot that launched the original turn.
                 kwargs = {"turn_author": sender} if sender and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
                 follow = cli.agent.run_conversation(
-                    user_message=text, conversation_history=history, **kwargs,
+                    user_message=mailbox.with_status_note(text, kwargs), conversation_history=history, **kwargs,
                 )
                 if isinstance(follow, dict) and follow.get("messages"):
                     history = follow["messages"]

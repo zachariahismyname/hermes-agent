@@ -6,8 +6,12 @@ never executes an agent turn or treats a terminal process exit as delivery succe
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import errno
 import json
 import logging
+import os
+import re
 import subprocess
 import sys
 import threading
@@ -17,18 +21,101 @@ from pathlib import Path
 _workers = set()
 _workers_lock = threading.Lock()
 _last_sweep = {}
+_busy_logged = {}
 logger = logging.getLogger(__name__)
 RECEIPT_AUTHOR = {"id": "bot:__delivery_receipt__", "name": "Hermes delivery receipt", "is_bot": True}
 
 
 def _indexes(paths):
     for path in paths:
+        # Recovery transport sidecars share this directory and may disappear
+        # while the child consumes them. They are not durable sender indexes.
+        if re.fullmatch(r"[0-9a-f]{32,64}\.json", path.name) is None:
+            continue
         try:
             record = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(record, dict) and "sender_session" in record:
                 yield path, record
         except (ValueError, OSError):
             logger.warning("Unreadable delivery index retained: %s", path, exc_info=True)
+
+
+@contextlib.contextmanager
+def _try_recovery_lock(path):
+    """Skip an already-running recovery instead of blocking a second sweeper.
+
+    Keep the existing lock path/byte so this also excludes older recovery
+    workers. Closing the handle releases ownership after a crash on either OS.
+    """
+    from tools.bot_relay import _turn_lock_fd
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            _turn_lock_fd(fd, acquire=True)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK}:
+                raise
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):  # close also releases the native lock
+                _turn_lock_fd(fd, acquire=False)
+    finally:
+        os.close(fd)
+
+
+def _attempt_started(attempt):
+    """Start time of the last recovery attempt, or None when absent or unreadable."""
+    try:
+        return float(attempt.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        logger.warning("Unreadable recovery attempt marker treated as stale: %s", attempt)
+        return None
+
+
+def _log_busy_recovery(delivery_id, attempt):
+    """A runner already owns this recovery; say so at most once a minute per delivery."""
+    now = time.monotonic()
+    with _workers_lock:
+        if now - _busy_logged.get(delivery_id, float("-inf")) < 60:
+            return
+        _busy_logged[delivery_id] = now
+    started = _attempt_started(attempt)
+    logger.info("Delivery recovery for %s is already running in another process (started %s ago); skipped",
+                delivery_id, f"{time.time() - started:.0f}s" if started is not None else "at an unknown time")
+
+
+def sender_consumes_receipts(agent):
+    """Whether this sender's conversation is its home's ADVERTISED Bot Chat mailbox consumer.
+
+    Receipts reach a sender only through that consumer (Desktop/TUI session or quiet CLI worker).
+    An interactive CLI owner advertises none, so while it holds the chat its receipts cannot be
+    queued: such a sender must keep the process-completion / poll return path instead.
+    """
+    from hermes_state import SessionDB
+    from tools.bot_live_delivery import find_canonical_live_owner
+
+    db = getattr(agent, "_session_db", None)
+    key = getattr(agent, "session_id", None)
+    if not db or not isinstance(key, str) or not key:
+        return False
+    home = Path(db.db_path).resolve().parent
+    owner = find_canonical_live_owner(home)
+    if owner is None:
+        return False
+    if owner["session_id"] == key:
+        return True
+    reader = SessionDB(db_path=home / "state.db", read_only=True)
+    try:
+        return reader.get_compression_tip(key) == owner["session_id"]
+    finally:
+        reader.close()
 
 
 def register_outgoing(agent, record, argv, dm_file, author):
@@ -57,7 +144,6 @@ def register_outgoing(agent, record, argv, dm_file, author):
 def _recover_in_background(home, record):
     """Revisit an existing intent after restart; child still claims under its lease."""
     from agent.memory_provider import spawn_context_thread
-    from hermes_cli.active_sessions import _FileLock
     from tools.bot_relay import delivery_env
     from hermes_cli._subprocess_compat import windows_hide_flags
     from tools import bot_mode_dm
@@ -72,11 +158,15 @@ def _recover_in_background(home, record):
 
     def work():
         try:
-            with _FileLock(Path(marker)):
+            with _try_recovery_lock(Path(marker)) as acquired:
                 attempt = Path(marker + ".attempt")
-                if attempt.exists() and time.time() - float(attempt.read_text(encoding="utf-8")) < 30:
+                if not acquired:
+                    _log_busy_recovery(record["delivery_id"], attempt)
                     return
-                attempt.write_text(str(time.time()), encoding="utf-8")
+                if (started := _attempt_started(attempt)) is not None and time.time() - started < 30:
+                    return
+                # Atomic: a torn marker must not block every later sweep of this delivery.
+                atomic_write_text(attempt, str(time.time()), mode=0o600)
                 ticket = read_delivery_result(record["recipient_home"], record["delivery_id"])
                 if not ticket or ticket["status"] != "queued":
                     return
@@ -166,7 +256,9 @@ def poll_outgoing(home, session_id):
                 payload = {key: result[key] for key in ("delivery_id", "status", "reply", "error", "reason") if key in result}
                 existing = deliver_to_live_owner(home, owner,
                     "[Delivery receipt — status of your earlier message, not a new assignment. "
-                    "Do not acknowledge or resend solely because this receipt arrived.]\n" + json.dumps(payload),
+                    "Do not acknowledge or resend solely because this receipt arrived. "
+                    "If no follow-up is needed, respond with exactly NO_REPLY; "
+                    "do not use an empty or reasoning-only response.]\n" + json.dumps(payload),
                     delivery_id=receipt_id, author=RECEIPT_AUTHOR)
             # A crash after enqueue is safe: next pass finds the same receipt ID.
             record[receipt_field] = receipt_id

@@ -2195,15 +2195,32 @@ def _probe_credentials(agent) -> str:
     return ""
 
 
+# Container roots the runtime reads but DEFAULT_CONFIG omits (hermes_cli.config._EXTRA_KNOWN_ROOT_KEYS),
+# by empty form. The remaining extra roots are scalars, or fallback_model (null = disabled): valid as null.
+_OPTIONAL_ROOT_CONTAINERS = {
+    "mcp_servers": {}, "platforms": {}, "signal": {}, "image_gen": {}, "video_gen": {},
+    "smart_model_routing": {}, "platform_toolsets": {}, "timeouts": {},
+    "known_plugin_toolsets": {}, "known_builtin_toolsets": {},
+    "custom_providers": [], "reset_triggers": [], "profile_routes": [], "tool_gateway_declined_tools": [],
+}
+
+
 def _probe_config_health(cfg: dict) -> str:
     """Warn on bare YAML keys (`agent:` → None, silently dropping nested settings) and an unknown ``display.personality``."""
     if not isinstance(cfg, dict):
         return ""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
     warnings: list[str] = []
-    if null_keys := sorted(k for k, v in cfg.items() if v is None):
+    # Absence from DEFAULT_CONFIG says nothing about type (multiplex_profiles is a valid
+    # nullable bool): only explicitly classified optional containers are sections.
+    section_defaults = {**_OPTIONAL_ROOT_CONTAINERS, **DEFAULT_CONFIG}
+    if null_keys := sorted(k for k, v in cfg.items()
+                           if v is None and isinstance(section_defaults.get(k), (dict, list))):
         keys = ", ".join(f"`{k}`" for k in null_keys)
-        warnings.append(f"config.yaml has empty section(s): {keys}. Remove the line(s) or set them to `{{}}` — "
-                        f"empty sections silently drop nested settings.")
+        empty = ", ".join(f"`{k}: {'[]' if isinstance(section_defaults[k], list) else '{}'}`" for k in null_keys)
+        warnings.append(f"config.yaml has empty section(s): {keys}. Remove the line(s) or set them empty "
+                        f"({empty}) — empty sections silently drop nested settings.")
     display_cfg = cfg.get("display")
     if isinstance(display_cfg, dict):
         personality = str(display_cfg.get("personality", "") or "").strip().lower()

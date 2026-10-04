@@ -75,9 +75,10 @@ def message_agent_tool_schema() -> dict:
                 "attribution automatically prefixed, and returns immediately with a "
                 "dispatch acknowledgement — status queued plus a delivery_id (the hand-off to a background "
                 "delivery process, not a delivery receipt). It does NOT return their reply and you must "
-                "not wait or poll for one — send it, finish your turn, and that process's "
-                "completion notification wakes you with the outcome: their reply, or the "
-                "delivery failure — unless the ack returns reply_delivery=\"poll\", in which case "
+                "not wait or poll for one — send it, finish your turn, and the outcome "
+                "(their reply, or the delivery failure) wakes you later; a teammate that "
+                "finishes without replying may only be noted at your next turn — unless the "
+                "ack returns reply_delivery=\"poll\", in which case "
                 "follow its process(action=\"wait\") instruction before ending the turn. COMPOSE the message yourself: write what YOU want to say to "
                 "that agent (lead with the point; include the concrete ask or result). "
                 "Never paste the user's words verbatim — paraphrase the actionable "
@@ -425,7 +426,14 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
 
 
 class _SessionOwnershipRefused(RuntimeError):
-    """The CLI explicitly refused before executing the input; safe to enqueue it."""
+    """The CLI explicitly refused before executing the input; safe to enqueue it — unless
+    ``prior_attempt_ran``: the policy retry was refused after an earlier attempt of the SAME
+    payload already ran (and may have had effects), so the outcome is unknown and the payload
+    must never be handed to another owner or retried."""
+
+    def __init__(self, message: str, *, prior_attempt_ran: bool = False):
+        super().__init__(message)
+        self.prior_attempt_ran = prior_attempt_ran
 
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
@@ -439,7 +447,10 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env)
 
+    from tools.bot_failure_reasons import session_ownership_refused
+
     proc = _turn()
+    prior_attempt_ran = False
     if proc.returncode != 0:
         from tools.bot_failure_reasons import RETRY_NONE, classify_agent_error, retry_action, turn_failure_text
         from tools.bot_relay import retry_turn_env
@@ -448,11 +459,12 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
         from hermes_cli.quiet_mailbox import DELIVERY_ID_ENV
         if not (env or {}).get(DELIVERY_ID_ENV) and retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
+            # A first attempt that was not itself a pre-execution refusal may have run the turn.
+            prior_attempt_ran = not session_ownership_refused(proc.returncode, proc.stderr)
             proc = _turn(retry_turn_env(env))
-    from tools.bot_failure_reasons import session_ownership_refused
 
     if session_ownership_refused(proc.returncode, proc.stderr):
-        raise _SessionOwnershipRefused('Another turn owns the target Bot Chat.')
+        raise _SessionOwnershipRefused('Another turn owns the target Bot Chat.', prior_attempt_ran=prior_attempt_ran)
     # Re-emit the transport's streams: stdout is the reply text the
     # completion notification carries back to the sending agent. A successful bare
     # silence marker is a delivery decision (same rule as the gateway and the live
@@ -655,12 +667,22 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
 
         if not isinstance(exc, (_SessionOwnershipRefused, TurnBusyError)):
             raise
+        if getattr(exc, "prior_attempt_ran", False):
+            # An earlier attempt of this payload ran before the retry was refused: its effects are
+            # unknown. Keep the reservation and payload for reconciliation; never hand it to the
+            # live owner (that would execute it again) and never report "no turn executed".
+            print(_live_outcome_unknown(dm_file, 'an earlier attempt ran before the retry was refused'))
+            return 1
         record = _admit_live_dm(home, dm_file, author, include_busy_owner=True) if home is not None else None
         if record is not None:
             return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file, argv=argv, author=author)
         print(json.dumps({'status': 'not_delivered', 'reason': 'target_busy',
                           'delivery_id': _dm_delivery_id(dm_file), 'evidence_file': dm_file,
                           'error': 'Another turn held the target session. Payload retained; no turn executed.'}))
+        # A proven pre-execution refusal is not an unknown outcome: keep the payload as evidence,
+        # but drop the attempt reservation so a deliberate retry is not refused as "needs
+        # reconciliation" forever.
+        _unlink_dm_file(str(pending_path))
         return 1
     finally:
         if consumed:
@@ -700,9 +722,13 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                 "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
                 "evidence_file": dm_file})
         if record is not None:
-            from tools.bot_delivery_outbox import register_outgoing
+            from tools.bot_delivery_outbox import register_outgoing, sender_consumes_receipts
             try:
-                durable_reply = register_outgoing(agent, record, argv, dm_file, author)
+                # A receipt is a usable return path only for an advertised mailbox consumer;
+                # otherwise keep the upstream completion-notification / poll path (no index, so
+                # no second copy of the reply arrives later as a receipt).
+                durable_reply = (sender_consumes_receipts(agent)
+                                 and register_outgoing(agent, record, argv, dm_file, author))
             except Exception as exc:
                 # Recipient admission may already have caused effects. Never turn
                 # a sender-index failure into permission to send a second ticket.
@@ -713,7 +739,9 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
             notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent,
                                                       durable_reply=durable_reply))
             result = dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
-                          detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn.")
+                          detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn."
+                          + (" A reply or failure arrives as a delivery receipt; a silent completion may only be noted "
+                             "at the start of your next turn." if durable_reply else ""))
             if notification.get("error"):
                 result["notification_error"] = notification["error"]
             elif notification.get("process_id"):
@@ -764,7 +792,8 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
         # From here the background runner owns the file (removed after the consumer finishes).
         transferred = True
         if durable_reply:
-            detail = "Durably queued. Finish your turn; the recipient receipt will arrive separately. Do not resend."
+            detail = ("Durably queued. Finish your turn; a reply or failure arrives as a separate receipt, "
+                      "a silent completion may only be noted on your next turn. Do not resend.")
         elif parsed.get("notify_on_complete") is False:
             # terminal_tool refused the completion promise: this session (api_server, one-shot
             # runner) cannot receive an async completion, so the recipient's reply would never

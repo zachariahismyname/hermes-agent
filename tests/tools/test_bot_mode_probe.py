@@ -378,3 +378,20 @@ def test_roster_resolves_default_to_root_home_over_stray_directory(tmp_path):
     assert homes["researcher"] == home / "profiles" / "researcher"
     names = [name for name, _ in roster]
     assert names.count("default") == 1
+
+
+def test_silence_the_protocol_teaches_is_the_silence_receipts_recognize(tmp_path):
+    """Recipients learn silence from this section; senders defer a receipt only for exact silence.
+    Every marker the protocol names must be one the receipt policy accepts, and silence must be
+    reserved for messages that needed nothing (requested work reports its outcome)."""
+    import re
+    from gateway.response_filters import LIVE_GATEWAY_SILENT_MARKERS
+    from tools.bot_receipt_policy import silence_reason
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=True)
+    section = bot_mode_probe.get_bot_mode_protocol_section(home)
+    taught = {m for m in LIVE_GATEWAY_SILENT_MARKERS if re.search(rf"(?<![\w\[]){re.escape(m)}(?![\w\]])", section)}
+    assert taught and all(silence_reason(m) for m in taught)
+    assert "report the outcome" in section

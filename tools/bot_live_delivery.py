@@ -278,10 +278,13 @@ def claim_pending_delivery(
             return None
         record = min(pending, key=lambda item: (
             item.get("sequence", item["created_at"]), item["delivery_id"]))
-        record.update(status="claimed", claimed_at=time.time_ns())
+        record.update(status="claimed", claimed_at=time.time_ns(),
+                      claim_process={"pid": os.getpid(), "parent_pid": os.getppid()})
         if record["owner"] != current:
             record["claimed_owner"] = current
         _write(root / f"{record['delivery_id']}.json", record)
+        log.info("Bot delivery claimed: id=%s session=%s lease=%s pid=%s parent_pid=%s",
+                 record["delivery_id"], current["session_id"], current["lease_id"], os.getpid(), os.getppid())
         return record
 
 
@@ -307,6 +310,7 @@ def complete_delivery(
             raise ValueError("delivery must be claimed before completion")
         record.update(outcome, completed_at=time.time_ns())
         _write(path, record)
+        log.info("Bot delivery terminal: id=%s status=%s pid=%s", key, status, os.getpid())
         return record
 
 

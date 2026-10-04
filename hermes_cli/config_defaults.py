@@ -1961,6 +1961,10 @@ DEFAULT_CONFIG = {
         # before failing with a structured 'target_busy' error. Deliveries are serialized per
         # profile with a cross-process file lock.
         "turn_wait_seconds": 120,
+        # A teammate that finishes your delivery with an exact silence marker (NO_REPLY)
+        # produces a status-only receipt. false = no model turn; the status is noted at the
+        # start of your next turn. true = wake you with a receipt turn, as for replies.
+        "wake_on_silent_completion": False,
     },
     "code_execution": {  # execute_code settings (programmatic tool calls).
         # project = run in the session cwd with the active venv/conda python so project deps and

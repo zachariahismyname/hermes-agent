@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -21,6 +22,9 @@ from typing import Any, Callable, MutableMapping
 
 # Nested A→B→C is one extra turn; this caps a runaway message_agent chain.
 _MAX_QUIET_NOTIFY_ROUNDS = 8
+# Mailbox-responsive linger slice: how long one completion wait may block before idle work runs.
+_IDLE_POLL_SECONDS = 0.5
+logger = logging.getLogger(__name__)
 
 # Last line a Kanban worker leaves in its own log: ``[kanban-worker-exit] rc=<code>``. A per-tick
 # ``hermes kanban dispatch`` process never reaped the worker, so ``os.waitpid`` cannot tell it how
@@ -238,9 +242,12 @@ def continue_quiet_notify_completions(
             if isinstance(idle_result, dict):
                 last = idle_result
             continue
-        remaining = max(deadline - time.monotonic(), 0.0)
-        wait = process_registry.wait_for_pending_completions(
-            None, timeout=min(remaining, 0.5) if idle_work is not None else remaining)
+        slice_started = time.monotonic()
+        remaining = max(deadline - slice_started, 0.0)
+        wait_options = {"timeout": remaining}
+        if idle_work is not None:
+            wait_options = {"timeout": min(remaining, _IDLE_POLL_SECONDS), "warn_on_timeout": False}
+        wait = process_registry.wait_for_pending_completions(None, **wait_options)
         drained = []
         for event, text in process_registry.drain_notifications(session_key=key, owns_event=owns_event):
             # Durable async_delegation events carry a delivery ledger: without the
@@ -266,8 +273,17 @@ def continue_quiet_notify_completions(
             if not _diagnostic_only_wake_muted([event for event, text in drained if text]):
                 last = follow
         if wait.get("timed_out") and idle_work is not None and time.monotonic() < deadline:
+            # A slice can report timed_out at once (pending interrupt, vanished detached
+            # session); keep the mailbox poll at its cadence instead of spinning on disk locks.
+            if not texts and (pause := _IDLE_POLL_SECONDS - (time.monotonic() - slice_started)) > 0:
+                time.sleep(min(pause, max(deadline - time.monotonic(), 0.0)))
             continue
         if wait.get("timed_out"):
+            if idle_work is not None:
+                logger.warning(
+                    "One-shot exit linger timed out after %ss with %d background "
+                    "process(es) still running: %s — they may be killed when this "
+                    "process exits.", linger_budget, len(wait["timed_out"]), ", ".join(wait["timed_out"]))
             break
         if not texts:
             if has_pending is not None and has_pending() and time.monotonic() < deadline:

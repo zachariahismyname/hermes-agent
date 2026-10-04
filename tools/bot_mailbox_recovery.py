@@ -25,11 +25,15 @@ def recover_without_owner(home, delivery_id, argv, dm_file, *, author=None):
     record = read_delivery_result(home, delivery_id)
     if not record or record["status"] != "queued" or find_canonical_owner(home) is not None:
         return False
+    # No state.db (never-opened, moved or removed profile): nothing to adopt the ticket into.
+    # Resolve the target BEFORE opening the DB; a read-only open of a missing file raises.
+    target = canonical_unowned_target(home)
+    if not target:
+        return False
     from hermes_state import SessionDB
     db = SessionDB(db_path=Path(home) / "state.db", read_only=True)
     try:
-        target = canonical_unowned_target(home)
-        if not target or db.get_compression_tip(record["owner"]["session_id"]) != target["session_id"]:
+        if db.get_compression_tip(record["owner"]["session_id"]) != target["session_id"]:
             return False
     finally:
         db.close()

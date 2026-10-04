@@ -722,7 +722,19 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     if take_speech_interrupted():
         run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
     run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+    run_message = _prepend_note(run_message, _delivery_status_note(session, run_message))
     return prompt, _prepend_note(run_message, _hud_surface_note(session)), cols, streamer
+
+
+def _delivery_status_note(session: dict, run_message: Any = "") -> str:
+    """Bot Chat: outgoing deliveries the recipient finished silently, announced once as model input
+    (their status-only receipts were settled without a turn; the persisted prompt is untouched)."""
+    # Native-image list overrides strip API-only text without preserving a wire sidecar.
+    # Leave notes pending until a string turn can persist/replay them without changing history.
+    if not isinstance(run_message, str) or not _is_bot_mode_session(session):
+        return ""
+    from tools.bot_receipt_policy import take_status_note
+    return take_status_note(_session_home(session), _submit_row_target_key(session))
 
 
 def _invoke_agent(
@@ -927,8 +939,11 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         except Exception:
             _error_surface = None
     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
+    silent = False
     if _is_bot_mode_session(session):
-        raw = _bot_mode_delivery_text(raw, successful=status == "complete")
+        delivered = _bot_mode_delivery_text(raw, successful=status == "complete")
+        # Exact-marker silence and an empty turn both deliver "": only the receipt knows which.
+        silent, raw = delivered == "" and raw != "", delivered
     payload = {"text": raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
@@ -982,6 +997,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         st.terminal_callback({
             "status": {"interrupted": "cancelled", "error": "failed"}.get(status, "settled"),
             "text": raw if isinstance(raw, str) else str(raw),
+            **({"silent": True} if silent else {}),
             **({"error": str(error_value or raw)} if status == "error" else {})})
         st.receipt_committed = True
     if st.receipt_committed:

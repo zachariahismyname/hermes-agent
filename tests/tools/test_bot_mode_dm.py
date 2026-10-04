@@ -1130,17 +1130,28 @@ def test_ack_names_poll_return_path_when_session_cannot_receive_completions(tmp_
     assert "proc_np1" in result["detail"]
 
 
-def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive_completions(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sender_consumes_mailbox", [False, True])
+def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive_completions(
+        tmp_path, monkeypatch, sender_consumes_mailbox):
     """#101142 sibling: a live-owner (Desktop) target still runs the same tracked runner whose
     stdout carries the reply. On a non-push sender the live-owner ack must propagate
-    ``reply_delivery="poll"`` and the wait instruction instead of 'finish your turn'."""
+    ``reply_delivery="poll"`` and the wait instruction instead of 'finish your turn'.
+
+    A correlated receipt is a return path ONLY when the sender's own conversation is
+    its home's advertised Bot Chat mailbox consumer (Desktop/TUI or quiet CLI). Then the runner starts
+    without a completion promise and no poll applies. Any other sender (e.g. an interactive CLI owner,
+    whose receipts cannot be queued while it holds the chat) keeps the upstream poll contract and
+    gets no outbox index, so the reply cannot also arrive later as a duplicate receipt.
+    """
     from tools import bot_live_delivery as live
     import tools.terminal_tool as terminal_tool_module
 
     home = _managed_home(tmp_path)
     target = home / "profiles" / "researcher"
     owner = dict(profile_home=str(target), session_id="bot", lease_id="lease", live_session_id="live")
-    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: owner if Path(h) == target else None)
+    sender = dict(profile_home=str(home), session_id="sess-1", lease_id="sender", live_session_id="sender-live")
+    owners = {target: owner, **({home: sender} if sender_consumes_mailbox else {})}
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: owners.get(Path(h)))
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
     monkeypatch.setattr(terminal_tool_module, "terminal_tool", lambda command, **kw: json.dumps({
         "output": "Background process started", "session_id": "proc_np2", "notify_on_complete": False}))
@@ -1148,8 +1159,15 @@ def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive
     result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
     assert result["process_id"] == "proc_np2"
-    assert result["reply_delivery"] == "poll"
-    assert "proc_np2" in result["detail"]
+    index = home / "runtime" / "bot_delivery_outbox" / f"{result['delivery_id']}.json"
+    if sender_consumes_mailbox:
+        assert result["reply_delivery"] == "notification"
+        assert "receipt" in result["detail"] and "wait" not in result["detail"].replace("Do NOT wait", "")
+        assert index.is_file()
+    else:
+        assert result["reply_delivery"] == "poll"
+        assert "proc_np2" in result["detail"]
+        assert not index.exists()
 
 
 def test_poll_reply_is_persisted_as_a_delivery_row_when_the_runner_exits(tmp_path, monkeypatch):
