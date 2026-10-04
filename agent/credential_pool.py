@@ -441,6 +441,13 @@ def _singleton_predates_entry(state: Any, entry: "PooledCredential") -> bool:
     return state_ts < entry_ts
 
 
+def _singleton_postdates_entry(state: Any, entry: "PooledCredential") -> bool:
+    """True only when the auth.json singleton is PROVABLY newer than *entry* (both stamped)."""
+    entry_ts = _parse_absolute_timestamp(entry.last_refresh)
+    state_ts = _parse_absolute_timestamp(state.get("last_refresh") if isinstance(state, dict) else None)
+    return entry_ts is not None and state_ts is not None and state_ts > entry_ts
+
+
 def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(error_context, dict):
         return {}
@@ -1283,7 +1290,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         return entry
 
     def _sync_entry_from_pool_store(self, entry: PooledCredential) -> PooledCredential:
-        """Adopt a token pair rotated by another pool instance (anthropic, xai-oauth).
+        """Adopt a token pair rotated by another pool instance (anthropic, xai-oauth, openai-codex).
 
         Re-reads the exact persisted row from the credential-pool store while
         the shared cross-process auth-store lock is held. Direct integrations
@@ -1297,11 +1304,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         the pool store, is token authority for those sources; a row with no
         token material at all is refused for the same reason.
         """
-        if self.provider not in ("anthropic", "xai-oauth") and plugin_refresh_hook(self.provider) is None:
+        if self.provider not in ("anthropic", "xai-oauth", "openai-codex") and plugin_refresh_hook(self.provider) is None:
             return entry
         is_anthropic = self.provider == "anthropic"
         is_xai = self.provider == "xai-oauth"
-        display = {"anthropic": "Anthropic", "xai-oauth": "xAI"}.get(self.provider, self.provider)
+        display = {"anthropic": "Anthropic", "xai-oauth": "xAI", "openai-codex": "Codex"}.get(self.provider, self.provider)
         if is_anthropic and is_borrowed_credential_source(entry.source, self.provider):
             return entry
         try:
@@ -1332,8 +1339,12 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
     _sync_anthropic_entry_from_pool_store = _sync_entry_from_pool_store
 
-    def _sync_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
+    def _sync_entry_from_auth_store(self, entry: PooledCredential, *, require_newer: bool = False) -> PooledCredential:
         """Sync a Codex / xAI device_code entry from auth.json ``providers.<id>.tokens``.
+
+        ``require_newer``: *entry* holds a pair a peer just rotated in the pool store, so the singleton
+        may supersede it only when PROVABLY newer; adopt-on-difference (#70111) would let an unstamped
+        stale singleton replace the live pair with a consumed one.
 
         A fresh ``hermes model`` / ``hermes auth`` login writes new tokens
         under ``_auth_store_lock`` while the pool entry may sit frozen behind
@@ -1394,6 +1405,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     state.get("last_refresh") if isinstance(state, dict) else None,
                     entry.last_refresh,
                 )
+                should_adopt = False
+            if should_adopt and require_newer and not _singleton_postdates_entry(state, entry):
+                logger.info("Pool entry %s: keeping the pair a peer rotated in the pool store; the auth.json "
+                            "singleton is not provably newer", entry.id)
                 should_adopt = False
             if should_adopt:
                 logger.debug(
@@ -1536,10 +1551,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # the winner's rotated token and skips the POST.
         with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
             if self.provider == "openai-codex":
-                synced = self._sync_entry_from_auth_store(entry)
-                if synced is not entry and not force and not self._entry_needs_refresh(synced):
+                # A ``hermes auth add`` row rotates in the pool store only, never the singleton
+                # (#39236), so re-read the row too. A pair a peer already rotated is adopted, not
+                # re-POSTed, even when forced: the failure was the stale pair's, and every extra POST
+                # rotates the chain under the other processes holding it.
+                pooled = self._sync_entry_from_pool_store(entry)
+                synced = self._sync_entry_from_auth_store(pooled, require_newer=pooled is not entry)
+                if synced is not entry and not self._entry_needs_refresh(synced):
                     return synced
-                return self._refresh_entry_impl(synced, force=force)
+                return self._refresh_entry_impl(synced, force=force, singleton_synced=True)
             synced = self._sync_entry_from_pool_store(entry)
             if self.provider == "anthropic" and synced.source == "claude_code":
                 # claude_code entries are NOT profile-owned: the refresh token
@@ -1705,7 +1725,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             last_refresh=refreshed.get("last_refresh"),
         )
 
-    def _refresh_entry_impl(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+    def _refresh_entry_impl(self, entry: PooledCredential, *, force: bool,
+                            singleton_synced: bool = False) -> Optional[PooledCredential]:
         # Single-use-token providers adopt fresher tokens from their store
         # BEFORE spending the refresh_token; ``entry`` is rebound to the synced
         # row so the failure path below recovers against the pair we POSTed.
@@ -1713,7 +1734,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if self.provider == "anthropic":
                 updated = self._refresh_anthropic(entry)
             elif self.provider in _TOKENS_SINGLETON_PROVIDERS:
-                entry = self._sync_entry_from_auth_store(entry)
+                if not singleton_synced:  # The caller already synced under this same lock hold.
+                    entry = self._sync_entry_from_auth_store(entry)
                 updated = self._post_tokens_refresh(entry)
             elif (plugin_refresh := plugin_refresh_hook(self.provider)) is not None:
                 rotated = plugin_refresh(entry)
