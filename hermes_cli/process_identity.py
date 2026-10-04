@@ -9,6 +9,7 @@ root — no launcher→worker chains left holding ``.pyd`` locks.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -38,7 +39,11 @@ _IS_WINDOWS = platform.system() == "Windows"
 # Module-global job handle: must live exactly as long as this process so the
 # kernel closes it (and kills the job) when we die. Never close it manually.
 _JOB_HANDLE = None
+# In-process only: every profile process of an install (10 concurrent bots in the S4 soak) appends to
+# the same root ledger, so the read-modify-write is also held under ``_ledger_file_lock``.
 _LEDGER_LOCK = threading.Lock()
+_LEDGER_FILE_LOCK_TIMEOUT_S = 5.0
+_LEDGER_READ_ATTEMPTS = 20
 
 
 def install_id(project_root: Optional[Path] = None) -> str:
@@ -142,38 +147,105 @@ def _ledger_path() -> Path:
         return Path(get_hermes_home()) / LEDGER_FILENAME
 
 
+@contextlib.contextmanager
+def _ledger_file_lock(path: Path):
+    """Cross-process exclusive lock beside the ledger. Yields True when held, False when the bounded wait
+    ran out or the lock file is unusable: ledger callers are best-effort and must never stall a start."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield False
+        return
+    held = False
+    try:
+        deadline = time.monotonic() + _LEDGER_FILE_LOCK_TIMEOUT_S
+        while True:
+            try:
+                if _IS_WINDOWS:
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # Byte 0; locking past EOF is allowed.
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    logger.debug("spawn ledger lock not acquired within %.0fs", _LEDGER_FILE_LOCK_TIMEOUT_S)
+                    break
+                time.sleep(0.02)
+        yield held
+    finally:
+        if held:
+            with contextlib.suppress(OSError):
+                if _IS_WINDOWS:
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _read_ledger_state(path: Path) -> tuple[Optional[list[dict]], bool]:
+    """``(entries, corrupt)``: entries ``None`` when unreadable or corrupt; ``corrupt`` only for bad content.
+
+    On Windows a read racing another process's atomic replace fails with a transient sharing violation
+    (PermissionError). That is not corruption: quarantining on it parked a healthy ledger aside and lost
+    every registered process (S4 soak-05)."""
+    for attempt in range(_LEDGER_READ_ATTEMPTS):
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            break
+        except FileNotFoundError:
+            return [], False
+        except PermissionError:
+            if attempt == _LEDGER_READ_ATTEMPTS - 1:
+                return None, False
+            time.sleep(0.05)
+        except UnicodeError:
+            return None, True
+        except OSError:
+            return None, False
+    if not text.strip():
+        return [], False
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return None, True
+    if not isinstance(parsed, list):
+        return None, True
+    return [e for e in parsed if isinstance(e, dict)], False
+
+
 def _read_ledger(path: Path) -> Optional[list[dict]]:
-    """Entries list, ``[]`` for empty/missing, ``None`` for CORRUPT (never silently an empty roster).
+    """Entries list, ``[]`` for empty/missing, ``None`` for CORRUPT or unreadable (never silently an empty roster).
 
     Mirrors the #89298 contract: corrupt is a distinct state that must never be silently treated as an empty
     roster.
     """
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except FileNotFoundError:
-        return []
-    except (OSError, UnicodeError):
-        return None
-    if not text.strip():
-        return []
-    try:
-        parsed = json.loads(text)
-    except (ValueError, TypeError):
-        return None
-    return [e for e in parsed if isinstance(e, dict)] if isinstance(parsed, list) else None
+    return _read_ledger_state(path)[0]
 
 
 def _read_ledger_or_quarantine(path: Path) -> Optional[list[dict]]:
-    """Ledger entries; ``None`` after parking a corrupt file. Caller holds ``_LEDGER_LOCK``."""
-    entries = _read_ledger(path)
-    if entries is None:
-        parked = path.with_suffix(path.suffix + ".corrupt")
-        try:
-            os.replace(path, parked)
-            logger.warning("spawn ledger was unreadable; moved to %s", parked)
-        except OSError:
-            pass
+    """Ledger entries; ``None`` after parking a corrupt file (or for one that stayed unreadable, which is
+    left in place). Caller holds ``_LEDGER_LOCK`` and ``_ledger_file_lock``."""
+    entries, corrupt = _read_ledger_state(path)
+    if corrupt:
+        _quarantine_ledger(path)
     return entries
+
+
+def _quarantine_ledger(path: Path) -> None:
+    parked = path.with_suffix(path.suffix + ".corrupt")
+    try:
+        os.replace(path, parked)
+        logger.warning("spawn ledger was unreadable; moved to %s", parked)
+    except OSError:
+        pass
 
 
 def _same_incarnation(proc, create_time: Optional[float]) -> bool:
@@ -286,14 +358,21 @@ def _new_entry(
 def _append_entry(entry: LedgerEntry) -> bool:
     """Prune dead entries and append ``entry`` — the ONLY ledger write path.
 
-    Serialized under ``_LEDGER_LOCK`` with an atomic tmp+replace; no writer touches the file
-    outside this function.
+    Serialized under ``_LEDGER_LOCK`` and the cross-process ``_ledger_file_lock`` with an atomic
+    tmp+replace; no writer touches the file outside this function.
 
     See #91660.
     """
     path = _ledger_path()
-    with _LEDGER_LOCK:
-        entries = _read_ledger_or_quarantine(path) or []
+    with _LEDGER_LOCK, _ledger_file_lock(path) as held:
+        if not held:
+            return False  # Writing without the lock would drop a concurrent process's entry.
+        entries, corrupt = _read_ledger_state(path)
+        if corrupt:
+            _quarantine_ledger(path)
+        elif entries is None:
+            return False  # Unreadable is not empty: rewriting from [] would erase every live entry.
+        entries = entries or []
         # Drop malformed entries, our own stale entry, and provably dead pids.
         pruned = [
             e for e in entries
@@ -353,8 +432,9 @@ def ledger_entries(
     it block the caller either.
     """
     want_install = install_id(project_root)
-    with _LEDGER_LOCK:
-        entries = _read_ledger_or_quarantine(_ledger_path())
+    path = _ledger_path()
+    with _LEDGER_LOCK, _ledger_file_lock(path) as held:
+        entries = _read_ledger_or_quarantine(path) if held else _read_ledger(path)
     if entries is None:
         return []
     return [
