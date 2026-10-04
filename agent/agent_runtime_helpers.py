@@ -613,6 +613,8 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
                 (prev_content + "\n\n" + new_content) if prev_content and new_content else (prev_content or new_content)
             )
             had_api_sidecar = "api_content" in prev
+            from agent.user_turn_provenance import preserve_merged_user_origin
+            preserve_merged_user_origin(prev, prev, msg)
             prev["content"] = merged_content
             # The clean-text persist override must replace only the absorbed turn, never the
             # unanswered text before it; kept across replay passes (an empty turn absorbs too).
@@ -1147,7 +1149,11 @@ def drop_thinking_only_and_merge_users(
             # alternation, but is safer than raising in a hot path).
             merged.append(m)
         else:
-            merged[-1] = {**prev, "content": content}  # copy so caller dicts are never mutated
+            from agent.user_turn_provenance import preserve_merged_user_origin
+            combined = dict(prev)
+            preserve_merged_user_origin(combined, prev, m)
+            combined["content"] = content
+            merged[-1] = combined  # copy so caller dicts are never mutated
             merges += 1
     if dropped == 0 and merges == 0:
         return messages
