@@ -395,3 +395,8 @@ def test_silence_the_protocol_teaches_is_the_silence_receipts_recognize(tmp_path
     taught = {m for m in LIVE_GATEWAY_SILENT_MARKERS if re.search(rf"(?<![\w\[]){re.escape(m)}(?![\w\]])", section)}
     assert taught and all(silence_reason(m) for m in taught)
     assert "report the outcome" in section
+    # A recipient's final answer returns to the sender on every delivery path, so the protocol must
+    # route replies through the answer, never through a second message_agent delivery (canary-06:
+    # replying via message_agent duplicated every reply and acknowledged an FYI).
+    assert "delivered back to them automatically" in section
+    assert "reply concisely via message_agent" not in section

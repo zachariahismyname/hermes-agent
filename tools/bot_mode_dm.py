@@ -68,8 +68,10 @@ def message_agent_tool_schema() -> dict:
         "function": {
             "name": MESSAGE_AGENT_TOOL_NAME,
             "description": (
-                "Send a message to ANOTHER agent (teammate) on this install, or to an "
-                "agent on a registered peer gateway. This is FIRE-AND-FORGET and "
+                "Send a NEW message to ANOTHER agent (teammate) on this install, or to an "
+                "agent on a registered peer gateway. Never use it to answer a teammate's "
+                "message: your final answer to that message already goes back to them. "
+                "This is FIRE-AND-FORGET and "
                 "asynchronous, like texting: it validates the target against the live "
                 "roster, delivers your message into that agent's own Bot Chat with your "
                 "attribution automatically prefixed, and returns immediately with a "
