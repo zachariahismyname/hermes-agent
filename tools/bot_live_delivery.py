@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from utils import atomic_json_write, atomic_write_text, fsync_directory
+from utils import atomic_json_write, atomic_write_text, fsync_directory, read_text_contended
 from pathlib import Path
 from typing import Any, Callable
 
@@ -107,10 +107,16 @@ def _locked(home: Path | str):
         yield root
 
 
-def _read(path: Path) -> dict[str, Any] | None:
-    """Exact-id read: absent → None; unreadable or not a JSON object → raises (callers fail closed)."""
+def _read(path: Path, *, ride_out_contention: bool = True) -> dict[str, Any] | None:
+    """Exact-id read: absent → None; unreadable or not a JSON object → raises (callers fail closed).
+
+    Tickets are read without the dir lock while other processes atomically replace them; on Windows
+    that read can hit a transient sharing violation, which used to abort a whole receipt-recovery pass
+    or the sender's ``await_delivery`` wait (S4 soak-05). ``read_text_contended`` rides it out. Bulk
+    scans opt out: they run under the dir lock and already skip an unreadable ticket until the next
+    pass, so a per-ticket budget would multiply across the directory."""
     try:
-        record = json.loads(path.read_text(encoding="utf-8-sig"))
+        record = json.loads(read_text_contended(path) if ride_out_contention else path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return None
     if not isinstance(record, dict):
@@ -156,7 +162,7 @@ def _scan_read(path: Path) -> dict[str, Any] | None:
     licensing an overwrite of a possibly-live receipt.
     """
     try:
-        record = _read(path)
+        record = _read(path, ride_out_contention=False)
         problem = None if record is None else _ticket_shape_error(path, record)
     except (OSError, ValueError) as exc:  # ValueError: corrupt JSON and invalid UTF-8 alike
         record, problem = None, str(exc)

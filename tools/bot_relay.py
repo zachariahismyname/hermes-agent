@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 from tools.bot_mode_probe import _default_home, _hermes_root, alias_forms
-from utils import atomic_json_write
+from utils import atomic_json_write, read_text_contended
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,7 @@ def write_remote_roster(root: Path | str, rows: Any) -> int:
 def read_remote_roster(root: Path | str) -> list[dict]:
     """The current remote roster (possibly empty). Never raises."""
     try:
-        raw = (relay_root(root) / ROSTER_FILE).read_text(encoding="utf-8-sig")
+        raw = read_text_contended(relay_root(root) / ROSTER_FILE)  # Contention must not read as an empty roster.
         data = json.loads(raw)
         agents = data.get("agents") if isinstance(data, dict) else None
         return [r for r in map(_normalize_roster_row, agents) if r] if isinstance(agents, list) else []

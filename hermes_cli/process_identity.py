@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
-from utils import atomic_json_write
+from utils import atomic_json_write, read_text_contended
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,6 @@ _JOB_HANDLE = None
 # the same root ledger, so the read-modify-write is also held under ``_ledger_file_lock``.
 _LEDGER_LOCK = threading.Lock()
 _LEDGER_FILE_LOCK_TIMEOUT_S = 5.0
-_LEDGER_READ_ATTEMPTS = 20
 
 
 def install_id(project_root: Optional[Path] = None) -> str:
@@ -196,20 +195,14 @@ def _read_ledger_state(path: Path) -> tuple[Optional[list[dict]], bool]:
     On Windows a read racing another process's atomic replace fails with a transient sharing violation
     (PermissionError). That is not corruption: quarantining on it parked a healthy ledger aside and lost
     every registered process (S4 soak-05)."""
-    for attempt in range(_LEDGER_READ_ATTEMPTS):
-        try:
-            text = path.read_text(encoding="utf-8-sig")
-            break
-        except FileNotFoundError:
-            return [], False
-        except PermissionError:
-            if attempt == _LEDGER_READ_ATTEMPTS - 1:
-                return None, False
-            time.sleep(0.05)
-        except UnicodeError:
-            return None, True
-        except OSError:
-            return None, False
+    try:
+        text = read_text_contended(path)
+    except FileNotFoundError:
+        return [], False
+    except UnicodeError:
+        return None, True
+    except OSError:
+        return None, False
     if not text.strip():
         return [], False
     try:

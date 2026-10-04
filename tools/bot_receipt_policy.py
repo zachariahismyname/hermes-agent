@@ -237,7 +237,8 @@ def _bounded_note_lock(lock: Path):
 
 
 def _read_index(home: Path, task_id: str) -> dict:
-    return json.loads((home / "runtime/bot_delivery_outbox" / f"{task_id}.json").read_text(encoding="utf-8-sig"))
+    from utils import read_text_contended  # Unlocked exact read racing the outbox writer's atomic replace.
+    return json.loads(read_text_contended(home / "runtime/bot_delivery_outbox" / f"{task_id}.json"))
 
 
 def _record_status_note(home: Path, task_id: str, receipt_id: str) -> None:
