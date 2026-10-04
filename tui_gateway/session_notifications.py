@@ -647,7 +647,7 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
                 or owner.get("session_id") != session.get("session_key")):
             return False
         # The mailbox matches each envelope to this pinned lease/live id and compression lineage.
-        claimed = claim_pending_delivery(home, owner)
+        claimed = claim_pending_delivery(home, owner, recover_unclaimed=True)
         if claimed is None:
             return False
         session["running"] = True

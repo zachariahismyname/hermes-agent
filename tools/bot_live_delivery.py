@@ -241,28 +241,46 @@ def _matches(home: Path | str, record: dict, owner: dict) -> bool:
 
 
 def claim_pending_delivery(
-    profile_home: Path | str, owner: dict[str, Any],
+    profile_home: Path | str, owner: dict[str, Any], *, recover_unclaimed: bool = False,
 ) -> dict[str, Any] | None:
     """Claim oldest matching input exactly once; caller supplies its current lease.
 
-    A lease transfer across compression is accepted only along the original
-    stored session's compression chain. A new lease/live session cannot steal it.
+    A lease transfer across compression is accepted along the original session's
+    chain. Restart recovery requires the verified current canonical live owner
+    and an absent original lease. Claimed work is never replayed.
     Caller must hold its normal turn-admission guard before invoking this.
     """
     current = _owner(profile_home, owner)
     if not _root(profile_home).is_dir():
         return None
     with _locked(profile_home) as root:
+        recovery_owner = None
+        active_leases = set()
+        if recover_unclaimed and find_canonical_live_owner(profile_home) == current:
+            from hermes_cli.active_sessions import active_session_registry_snapshot
+
+            recovery_owner = current
+            active_leases = {entry["lease_id"] for entry in active_session_registry_snapshot(registry_home=profile_home)}
         pending = []
         for path in root.glob("*.json"):
             record = _scan_read(path)
-            if record is not None and record["status"] == "queued" and _matches(profile_home, record, current):
+            if record is None or record["status"] != "queued":
+                continue
+            if _matches(profile_home, record, current):
                 pending.append(record)
+            elif recovery_owner and record["owner"]["lease_id"] not in active_leases:
+                # Keep original admission identity immutable for idempotent sender retries.
+                rebound = dict(record, owner={**record["owner"], "lease_id": current["lease_id"],
+                                             "live_session_id": current["live_session_id"]})
+                if _matches(profile_home, rebound, current):
+                    pending.append(record)
         if not pending:
             return None
         record = min(pending, key=lambda item: (
             item.get("sequence", item["created_at"]), item["delivery_id"]))
         record.update(status="claimed", claimed_at=time.time_ns())
+        if record["owner"] != current:
+            record["claimed_owner"] = current
         _write(root / f"{record['delivery_id']}.json", record)
         return record
 

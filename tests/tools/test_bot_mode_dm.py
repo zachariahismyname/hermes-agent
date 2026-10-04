@@ -506,7 +506,7 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     assert result["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "query-file"
-    assert transport_argv[0] == str(hermes_entry)
+    assert Path(transport_argv[0]) == hermes_entry
     assert transport_argv[1:] == ["-p", "researcher", "chat", "--in", "~", "-c", "Bot Chat",
                                   "--create-if-missing", "-Q"]
 
@@ -516,7 +516,8 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     assert result2["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
-    assert transport_argv == [str(hermes_entry), "-p", "default", "peer", "dm", "spark"]
+    assert Path(transport_argv[0]) == hermes_entry
+    assert transport_argv[1:] == ["-p", "default", "peer", "dm", "spark"]
 
 
 def test_peer_delivery_author_carries_the_sender_hostname_and_local_stays_bare(tmp_path, monkeypatch):
@@ -673,7 +674,7 @@ def test_delivery_runner_keeps_file_for_child_then_unlinks(tmp_path, stdin_file,
 
 
 
-def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
+def test_delivery_runner_preserves_child_failure_and_evidence(tmp_path):
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("secret", encoding="utf-8")
     child = tmp_path / "fail.py"
@@ -689,7 +690,8 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     )
 
     assert returncode == 7
-    assert not dm_file.exists()
+    assert dm_file.exists()
+    assert Path(str(dm_file) + '.pending.json').exists()
 
 
 def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
@@ -701,6 +703,7 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
     child.write_text(
         "import sys\n"
         "print('Session abc already has a live owner (desktop, pid 1).', file=sys.stderr)\n"
+        "print('hermes-refusal-reason: SESSION_NOT_OWNED', file=sys.stderr)\n"
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
@@ -819,7 +822,7 @@ def test_real_delivery_command_round_trip_carries_author(tmp_path):
 
 
 
-def test_delivery_main_maps_launch_exception_to_one_and_unlinks(tmp_path, monkeypatch):
+def test_delivery_main_maps_launch_exception_to_one_and_preserves_evidence(tmp_path, monkeypatch):
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("secret", encoding="utf-8")
 
@@ -833,7 +836,7 @@ def test_delivery_main_maps_launch_exception_to_one_and_unlinks(tmp_path, monkey
         )
         == 1
     )
-    assert not dm_file.exists()
+    assert dm_file.exists()
 
 
 def test_local_turn_decodes_utf8_reply_without_locale_default(tmp_path, monkeypatch, capsys):
@@ -1030,9 +1033,8 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
         bot_mode_dm._dm_dir()
 
 
-def test_cleanup_sweeps_stale_live_intents_and_keeps_fresh_ones(tmp_path, monkeypatch):
-    """``<dm file>.live.json`` holds the DM plaintext and outlives its runner for retries; the
-    housekeeping sweep must reap the orphans like it reaps the dm files themselves."""
+def test_cleanup_preserves_live_intents_regardless_of_age(tmp_path, monkeypatch):
+    """Age is not proof of settlement; pending or unreadable intents must survive restart."""
     import os
 
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
@@ -1042,8 +1044,8 @@ def test_cleanup_sweeps_stale_live_intents_and_keeps_fresh_ones(tmp_path, monkey
     fresh = tmp_path / "dm-new.txt.live.json"
     fresh.write_text("{}", encoding="utf-8")
 
-    assert bot_mode_dm.cleanup_bot_dm_cache() >= 1
-    assert not stale.exists()
+    assert bot_mode_dm.cleanup_bot_dm_cache() == 0
+    assert stale.exists()
     assert fresh.exists()
 
 

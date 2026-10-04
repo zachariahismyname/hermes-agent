@@ -158,6 +158,68 @@ def test_deliver_requires_params(home):
     assert "error" in err
 
 
+@pytest.mark.parametrize('arrival', ['during_lock_wait', 'at_cli_admission'])
+def test_deliver_hands_off_to_owner_appearing_after_discovery(home, monkeypatch, arrival):
+    import contextlib
+    from hermes_cli.active_sessions import try_acquire_active_session
+    from hermes_state import SessionDB
+    from tools import bot_live_delivery, bot_mode_dm
+
+    target_home = home / 'profiles' / 'ops'
+    db = SessionDB(db_path=target_home / 'state.db')
+    db.create_session(session_id='chat', source='cli')
+    db.set_session_title('chat', 'Bot Chat')
+    leases, spawned = [], []
+    lock_held = False
+
+    def acquire_owner():
+        lease, refusal = try_acquire_active_session(
+            session_id='chat', surface='desktop', config={}, registry_home=target_home,
+            metadata={'live_session_id': 'desktop', 'bot_live_delivery_consumer': True})
+        assert refusal is None
+        leases.append(lease)
+
+    @contextlib.contextmanager
+    def waiting(*args, **kwargs):
+        nonlocal lock_held
+        if arrival == 'during_lock_wait':
+            acquire_owner()
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    def cli_refusal(argv, **kwargs):
+        assert arrival == 'at_cli_admission'
+        assert lock_held
+        spawned.append(argv)
+        acquire_owner()
+        return subprocess.CompletedProcess(argv, 1, '', 'hermes-refusal-reason: SESSION_NOT_OWNED')
+
+    original_await = bot_live_delivery.await_delivery
+    def wait_without_lock(*args, **kwargs):
+        assert not lock_held, 'Do not wait for a reply while holding recipient admission'
+        return original_await(*args, **kwargs)
+
+    monkeypatch.setattr(bot_relay, 'acquire_turn_lock', waiting)
+    monkeypatch.setattr('hermes_cli.quiet_single_query.run_reported_turn', cli_refusal)
+    monkeypatch.setattr(bot_live_delivery, 'await_delivery', wait_without_lock)
+    monkeypatch.setattr(bot_mode_dm, '_LIVE_WAIT_SECONDS', 0)
+    try:
+        reply = _result(srv._methods['bot_relay.deliver'](1, {'profile': 'ops', 'message': 'racing delivery'}))
+        assert 'Queued' in reply['reply']
+        assert len(spawned) == (arrival == 'at_cli_admission')
+        paths = list((target_home / 'runtime' / 'bot_live_delivery').glob('*.json'))
+        assert len(paths) == 1
+        record = json.loads(paths[0].read_text())
+        assert record['status'] == 'queued' and record['message'] == 'racing delivery'
+    finally:
+        for lease in leases:
+            lease.release()
+        db.close()
+
+
 def test_deliver_restamps_relayed_sender_with_a_reply_safe_handle(home, monkeypatch):
     """#103731: the sender signs with its bare @handle, which for another machine's ``default`` is
     ``@hermes`` — the recipient's OWN default. The delivered text names the sender by the form this
@@ -595,19 +657,34 @@ def test_reported_turn_still_lingering_at_the_cap_is_booked_from_its_latest_repo
     exit code 0, never delivery_timeout — and is NOT killed, so its own handoff survives."""
     env = _child_argv(monkeypatch, """
         import os, time
-        from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV, write_turn_report
+        from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV, TURN_REPORT_NONCE_ENV, write_turn_report
         path = os.environ.pop(TURN_REPORT_FILE_ENV)
-        write_turn_report(path, exit_code=0, reply="asking the teammate")
+        nonce = os.environ.pop(TURN_REPORT_NONCE_ENV)
+        write_turn_report(path, exit_code=0, reply="asking the teammate", nonce=nonce)
         time.sleep(0.5)
-        write_turn_report(path, exit_code=0, reply="teammate says: done")
+        write_turn_report(path, exit_code=0, reply="teammate says: done", nonce=nonce)
         time.sleep(30)
         """)
     procs, spy = _spy_popen()
     tmp = tmp_path / "dm.txt"
     tmp.write_text("hi", encoding="utf-8")
-    started = time.monotonic()
+    started = None
+    def ready_child(*args, **kwargs):
+        # The test exercises a reported, lingering turn. Synchronize that state
+        # instead of assuming a cold Windows Python import finishes within 2s.
+        nonlocal started
+        from hermes_cli.quiet_single_query import TURN_REPORT_NONCE_ENV, read_turn_report
+        proc = spy(*args, **kwargs)
+        deadline = time.monotonic() + 30
+        while read_turn_report(str(tmp) + '.turn.json', proc.pid,
+                               nonce=kwargs['env'][TURN_REPORT_NONCE_ENV]) is None:
+            assert proc.poll() is None, 'reporting child exited during startup'
+            assert time.monotonic() < deadline, 'reporting child did not become ready'
+            time.sleep(0.05)
+        started = time.monotonic()
+        return proc
     try:
-        with mock.patch.object(subprocess, "Popen", side_effect=spy) as popen:
+        with mock.patch.object(subprocess, "Popen", side_effect=ready_child) as popen:
             result = methods_bot_relay._run_delivery("ops", str(tmp), env, timeout=2)
         elapsed = time.monotonic() - started
         assert (result.returncode, result.stdout, result.stderr) == (0, "teammate says: done", "")

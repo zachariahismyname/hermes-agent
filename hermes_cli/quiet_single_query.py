@@ -47,6 +47,9 @@ def exit_single_query(code: int) -> None:
 # contract as HERMES_TURN_AUTHOR): nothing the turn spawns inherits it, and a nested one-shot
 # never writes over its host's report — the record also carries the writer's pid.
 TURN_REPORT_FILE_ENV = "HERMES_QUIET_TURN_REPORT_FILE"
+# Per-invocation transport identity, consumed before tools can inherit it. A
+# Windows venv/CLI launcher PID is not necessarily the reporting Python PID.
+TURN_REPORT_NONCE_ENV = "HERMES_QUIET_TURN_REPORT_NONCE"
 
 
 def take_turn_report_path(environ: MutableMapping[str, str] = os.environ) -> str | None:
@@ -54,7 +57,8 @@ def take_turn_report_path(environ: MutableMapping[str, str] = os.environ) -> str
     return environ.pop(TURN_REPORT_FILE_ENV, None) or None
 
 
-def write_turn_report(path: str | None, *, exit_code: int, error: str = "", reply: str = "") -> None:
+def write_turn_report(path: str | None, *, exit_code: int, error: str = "", reply: str = "",
+                      nonce: str | None = None) -> None:
     """Atomically record ``{pid, exit_code, error, reply}`` at *path*; a no-op without a path. Never
     raises: the report is the spawner's convenience, the turn itself is already persisted. ``reply``
     is what the run will print — a spawner booking a lingering child from its report relays it."""
@@ -63,19 +67,26 @@ def write_turn_report(path: str | None, *, exit_code: int, error: str = "", repl
     from utils import atomic_json_write
 
     record = {"pid": os.getpid(), "exit_code": int(exit_code), "error": str(error or ""), "reply": str(reply or "")}
+    if nonce:
+        record["nonce"] = nonce
     # 0600 from creation: the record now carries the turn's answer, like the 0600 query file beside it.
     with contextlib.suppress(Exception):
         atomic_json_write(path, record, indent=None, mode=0o600)
 
 
-def read_turn_report(path: str, pid: int) -> dict | None:
+def read_turn_report(path: str, pid: int, *, nonce: str | None = None) -> dict | None:
     """The child's turn report, or None while absent, unreadable, or written by another process."""
     try:
         with open(path, encoding="utf-8-sig") as fh:
             record = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict) or record.get("pid") != pid:
+    if not isinstance(record, dict):
+        return None
+    # With a nonce, stale reports from a previous attempt (even the same PID)
+    # fail closed. Legacy direct callers retain their exact-PID contract.
+    matches = record.get("nonce") == nonce if nonce is not None else record.get("pid") == pid
+    if not matches:
         return None
     return record
 
@@ -113,12 +124,16 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
     locale codec, so the locale default stays correct there (#66566).
     """
     from hermes_cli._subprocess_compat import windows_hide_flags
+    import uuid
+
+    nonce = uuid.uuid4().hex
 
     if encoding is None and sys.platform == "win32":
         encoding = "utf-8"
     proc = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding=encoding, errors="replace", env={**env, TURN_REPORT_FILE_ENV: report_path},
+        encoding=encoding, errors="replace", env={**env, TURN_REPORT_FILE_ENV: report_path,
+                                                  TURN_REPORT_NONCE_ENV: nonce},
         cwd=cwd, creationflags=windows_hide_flags())
     streams: dict = {}
 
@@ -136,7 +151,7 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
         if report is not None and exit_grace is not None:
             break
         # Re-read while waiting for the cap: a follow-up turn rewrites the report with its answer.
-        report = read_turn_report(report_path, proc.pid) or report
+        report = read_turn_report(report_path, proc.pid, nonce=nonce) or report
         if time.monotonic() >= deadline:
             if report is not None:
                 break
@@ -146,7 +161,7 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
             # in the window between the last report check and the kill landing. Re-read once:
             # a report that appeared means the turn completed — book it instead of
             # misreporting a delivered turn as a timeout (and never re-notifying).
-            report = read_turn_report(report_path, proc.pid)
+            report = read_turn_report(report_path, proc.pid, nonce=nonce)
             if report is not None:
                 break
             raise subprocess.TimeoutExpired(argv, timeout)

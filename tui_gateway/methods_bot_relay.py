@@ -146,8 +146,7 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
         from tools.bot_mode_dm import _LIVE_WAIT_SECONDS
         owner_home = live_home if live_home is not None else Path(_hermes_home)
         owner = find_canonical_live_owner(owner_home)
-        if owner is not None:
-            record = deliver_to_live_owner(owner_home, owner, message, author=author)
+        def _live_reply(record):
             record = await_delivery(owner_home, record["delivery_id"], _LIVE_WAIT_SECONDS) or record
             if record["status"] == "settled":
                 from tui_gateway.prompt_turn import _bot_mode_delivery_text
@@ -161,6 +160,9 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
             error = str(record.get("error") or f"Bot Chat delivery {record['status']}")
             reason = record.get("reason") or (CANCELLED if record["status"] == "cancelled" else classify_agent_error(error))
             return _err(rid, 5092, f"delivery turn failed: {error[-500:]}", data={"reason": reason})
+
+        if owner is not None:
+            return _live_reply(deliver_to_live_owner(owner_home, owner, message, author=author))
 
         if live_sid:
             # A live Bot Chat here that advertises no mailbox: land the DM through prompt.submit, the
@@ -183,9 +185,19 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
         turn_env = delivery_env(author, live_home)
 
         fd, tmp = tempfile.mkstemp(prefix="hermes-relay-dm-", suffix=".txt", text=True)
+        proc = record = None
+        written = False
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(message)
+            written = True
+            from utils import atomic_json_write
+            from tools.bot_mode_dm import _admit_live_dm
+            from tools.bot_failure_reasons import session_ownership_refused
+
+            atomic_json_write(Path(tmp + '.pending.json'),
+                              {'profile_home': str(owner_home), 'status': 'requires_reconciliation'},
+                              mode=0o600, fsync_dir=True)
             # Per-profile turn lock serializes with any other delivery turn into this profile and
             # covers only the turn window. Worst-case hold is lock wait (bot_mode.turn_wait_seconds,
             # default 120s) + the 600s turn timeout, doubled on one retry — callers tolerate ~1320s.
@@ -193,8 +205,12 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
             # turn timeout below — doubled when the retry policy grants one bounded re-run — so clients
             # calling bot_relay.deliver must tolerate ~1320s before assuming failure. See #93091.
             with acquire_turn_lock(root, resolved):
-                proc = _run(resolved, tmp, turn_env)
-                if proc.returncode != 0:
+                record = _admit_live_dm(owner_home, tmp, author)
+                if record is None:
+                    proc = _run(resolved, tmp, turn_env)
+                if proc is not None and session_ownership_refused(proc.returncode, proc.stderr):
+                    record = _admit_live_dm(owner_home, tmp, author, include_busy_owner=True)
+                if proc is not None and proc.returncode != 0 and record is None:
                     # Retry policy: transient classes re-run the SAME session once; context_overflow
                     # too — the retried turn's pre-API compaction pass compacts the over-threshold
                     # transcript first (no fresh session is minted). Auth/quota/config never retry.
@@ -205,9 +221,15 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
                         # The failed attempt already persisted the DM; the re-run resumes that row.
                         from tools.bot_relay import retry_turn_env
                         proc = _run(resolved, tmp, retry_turn_env(turn_env))
+            if record is not None:
+                return _live_reply(record)
         finally:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
+            # Failed/uncertain turns keep their payload; housekeeping must not erase evidence.
+            if not written or (proc is not None and proc.returncode == 0 and record is None):
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp + '.pending.json')
         if proc.returncode != 0:
             from tools.bot_failure_reasons import classify_agent_error
             detail = _detail(proc)
