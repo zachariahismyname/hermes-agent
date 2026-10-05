@@ -348,6 +348,25 @@ def _anthropic_cfg_base_url(model_cfg: Dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
+_warned_codex_cfg_urls: set = set()
+
+
+def _codex_cfg_base_url(model_cfg: Dict[str, Any]) -> str:
+    """Config base_url for openai-codex (a Codex proxy, #40913), or "" when it is another vendor's
+    endpoint. Switching ``model.provider`` alone keeps the old URL — ``cli-config.yaml.example`` ships
+    OpenRouter's — and honouring it sent each fresh process's first Codex turn, ChatGPT bearer
+    included, to OpenRouter, whose 401 then spent the shared single-use refresh token (S4 soak-03)."""
+    cfg_base_url = _config_base_url_for_provider(model_cfg, "openai-codex")
+    if cfg_base_url and (base_url_host_matches(cfg_base_url, "openrouter.ai")
+                         or is_foreign_provider_endpoint("openai-codex", cfg_base_url)):
+        if cfg_base_url not in _warned_codex_cfg_urls:
+            _warned_codex_cfg_urls.add(cfg_base_url)
+            logger.warning("model.base_url %s is another provider's endpoint, not a Codex proxy; "
+                           "ignoring it for openai-codex (left over from a provider switch?)", cfg_base_url)
+        return ""
+    return cfg_base_url
+
+
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
@@ -533,7 +552,7 @@ def _pool_entry_mode_and_url(provider, entry, model_cfg, effective_model, base_u
             # model.base_url is the secondary proxy override (same rule as the generic tail below:
             # only when the pool row still carries the canonical URL).
             if base_url in ("", default_url):
-                base_url = _config_base_url_for_provider(model_cfg, provider) or base_url
+                base_url = _codex_cfg_base_url(model_cfg) or base_url
         if provider == "xai":
             # Env-seeded rows keep the registry host. model.base_url is the relay
             # override, and only while the row is still that host — an explicit

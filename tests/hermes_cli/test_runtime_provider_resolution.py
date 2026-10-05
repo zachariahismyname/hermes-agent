@@ -163,6 +163,38 @@ def test_codex_pool_honors_model_base_url(monkeypatch):
     assert resolved["api_mode"] == "codex_responses"
 
 
+def test_codex_pool_ignores_another_providers_endpoint_left_in_model_base_url(monkeypatch):
+    """Switching model.provider alone keeps the old model.base_url (cli-config.yaml.example ships
+    OpenRouter's). That is another provider's endpoint, not a Codex proxy: honouring it sent every
+    fresh process's first Codex turn, bearer included, to OpenRouter, whose 401 then spent the shared
+    single-use refresh token (S4 soak-03). The pool row's own endpoint must win."""
+    codex_url = rp.PROVIDER_REGISTRY["openai-codex"].inference_base_url.rstrip("/")
+
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual:device_code"
+        base_url = codex_url
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self, **_kwargs):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "openai-codex", "default": "gpt-5.3-codex",
+        "base_url": rp.OPENROUTER_BASE_URL})
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["base_url"].rstrip("/") == codex_url
+    assert resolved["api_key"] == "pool-token"
+
+
 def _xai_pool(url):
     class _Entry:
         access_token = "pool-token"
