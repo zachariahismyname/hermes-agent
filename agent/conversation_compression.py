@@ -2270,6 +2270,9 @@ def _is_real_user_message(message: Any) -> bool:
     anchor restoration."""
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
+    from agent.user_turn_provenance import merged_user_origin
+    if merged_user_origin(message) is not None:
+        return True
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
     text = _message_text(message).strip()

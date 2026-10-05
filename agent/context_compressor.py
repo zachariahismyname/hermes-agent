@@ -4431,6 +4431,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         """Recognize internal user-role rows by content marker (SessionDB drops metadata)."""
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
+        from agent.user_turn_provenance import merged_user_origin
+        if merged_user_origin(message) is not None:
+            return False
         if cls._is_context_summary_message(message):
             return True
         text = _content_text_for_contains(message.get("content")).strip()
@@ -4499,6 +4502,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         """Return whether *message* contains user input worth anchoring."""
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
+        from agent.user_turn_provenance import merged_user_origin
+        if merged_user_origin(message) is not None:
+            return True
         # display_kind rows (internal notifications, hidden scaffolding) are not human input
         # and must not anchor the tail or seed auto-focus. Mirrors is_user_originated_turn.
         # A /steer row is typed for the renderer and the alternation repair, but it IS human input.
@@ -4524,6 +4530,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         """Infer a compact focus hint from the most recent real user turns."""
         candidates: list[str] = []
         for msg in reversed(messages):
+            from agent.user_turn_provenance import merged_user_origin
+            msg = merged_user_origin(msg) or msg
             # display_kind notices are operational traffic, not user intent.
             if msg.get("role") != "user" or cls._is_synthetic_compression_user_turn(msg) or msg.get("display_kind"):
                 continue
@@ -4554,6 +4562,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         for msg in reversed(messages):
             if msg.get("role") != "user" or not _is_real_user_message(msg):
                 continue
+            msg = user_originated_turn_view(msg) or msg
             text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
             if not text:
                 continue
@@ -4955,7 +4964,8 @@ Write only the summary body. Do not include any preamble or prefix."""
                 # hand the model finished work as a fresh instruction.
                 return None
             # Empty assistant row (a bare reasoning/stub turn): keep looking.
-        return messages[last_user_idx]
+        from agent.user_turn_provenance import merged_user_origin
+        return merged_user_origin(messages[last_user_idx]) or messages[last_user_idx]
 
     def _reappend_inflight_user_task(
         self,
@@ -5841,6 +5851,9 @@ def split_user_originated_turn(message: Any) -> tuple[Optional[Dict[str, Any]], 
     """Split a user row into ``(handoff_only, live_view)``; either may be None; fresh dicts."""
     if not isinstance(message, dict) or message.get("role") != "user":
         return None, None
+    from agent.user_turn_provenance import merged_user_origin
+    if (origin := merged_user_origin(message)) is not None:
+        return None, origin
 
     is_summary = is_compaction_summary_message(message)
     handoff: Optional[Dict[str, Any]] = None

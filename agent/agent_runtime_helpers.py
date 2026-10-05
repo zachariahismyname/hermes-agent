@@ -689,6 +689,8 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
                 (prev_content + "\n\n" + new_content) if prev_content and new_content else (prev_content or new_content)
             )
             had_api_sidecar = "api_content" in prev
+            from agent.user_turn_provenance import preserve_merged_user_origin
+            preserve_merged_user_origin(prev, prev, msg)
             # Read before the marker is popped below. An unpersisted turn folded in ends the claim:
             # the dict no longer stands for durable rows only.
             if (prev.get(_DB_PERSISTED_MARKER) or prev.get(MERGED_DURABLE_ROWS)) and msg.get(_DB_PERSISTED_MARKER):
@@ -1273,7 +1275,11 @@ def drop_thinking_only_and_merge_users(
             # alternation, but is safer than raising in a hot path).
             merged.append(m)
         else:
-            merged[-1] = {**prev, "content": content}  # copy so caller dicts are never mutated
+            from agent.user_turn_provenance import preserve_merged_user_origin
+            combined = dict(prev)
+            preserve_merged_user_origin(combined, prev, m)
+            combined["content"] = content
+            merged[-1] = combined  # copy so caller dicts are never mutated
             merges += 1
     if dropped == 0 and merges == 0:
         return messages
