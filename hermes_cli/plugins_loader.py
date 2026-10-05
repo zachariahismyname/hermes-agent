@@ -150,11 +150,21 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     return outcome[0]
 
 
-def _evict_modules(module_name: str) -> None:
-    """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``."""
+def _evict_modules(module_name: str, *, owner: Optional[types.ModuleType] = None) -> None:
+    """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``.
+
+    With ``owner``, evict only while the package entry is still that load's module: a
+    loader abandoned by the deadline that fails later must not evict its successor.
+    """
+    if owner is not None and sys.modules.get(module_name) is not owner:
+        return
     prefix = f"{module_name}."
-    for name in [n for n in sys.modules if n == module_name or n.startswith(prefix)]:
-        del sys.modules[name]
+    # Unrelated threads import while we inspect the process-wide map: iterate a
+    # snapshot (dict.copy is atomic under the GIL). The per-entry identity check
+    # narrows, but does not close, the window against a concurrent replacement.
+    for name, module in sys.modules.copy().items():
+        if (name == module_name or name.startswith(prefix)) and sys.modules.get(name) is module:
+            sys.modules.pop(name, None)
 
 
 def _serialized_replacement(method):
@@ -704,7 +714,7 @@ class PluginLoaderMixin:
         except BaseException:
             # Don't leave a half-initialized module (or its partially imported relative submodules) cached — a
             # retry or a same-slug plugin in another profile would inherit broken state.
-            _evict_modules(module_name)
+            _evict_modules(module_name, owner=module)
             raise
         return module
 
