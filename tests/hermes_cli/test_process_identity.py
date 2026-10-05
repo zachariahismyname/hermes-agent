@@ -198,6 +198,86 @@ def test_register_self_falls_back_to_desktop_parent_env(tmp_path):
     assert me["spawner_create"] == pytest.approx(1755689000.123, abs=0.01)
 
 
+def test_unreadable_ledger_is_neither_quarantined_nor_overwritten(tmp_path):
+    # On Windows a read racing another process's atomic replace fails with a sharing violation. That
+    # is not corruption: parking the healthy ledger and rewriting it lost every registered process
+    # (S4 soak-05, 10 concurrent bots).
+    ledger = tmp_path / "spawn-ledger.json"
+    original = json.dumps([_entry(400, 2.0)])
+    ledger.write_text(original, encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def sharing_violation(self, *args, **kwargs):
+        if self == ledger:
+            raise PermissionError(13, "The process cannot access the file", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    fake = _fake_psutil({400: 2.0, 999: 50.0})
+    with patch.dict(sys.modules, {"psutil": fake}), \
+         patch.object(pi, "_ledger_path", return_value=ledger), \
+         patch.object(pi.os, "getpid", return_value=999), \
+         patch.object(Path, "read_text", sharing_violation):
+        assert pi.register_self("serve", project_root=Path("/x/install")) is False
+    assert not (tmp_path / "spawn-ledger.json.corrupt").exists()
+    assert ledger.read_text(encoding="utf-8") == original
+
+
+_CONCURRENT_REGISTRAR = r"""
+import os, sys, time
+from pathlib import Path
+from hermes_cli import process_identity as pi
+ledger, start, release, done = (Path(a) for a in sys.argv[1:5])
+pi._ledger_path = lambda: ledger
+done.with_suffix(".ready").write_text("ready")
+while not start.exists():
+    time.sleep(0.01)
+ok = all(pi.register_self("serve") for _ in range(15))
+# Published atomically: the parent treats the file's existence as completion.
+done.with_suffix(".tmp").write_text(f"{os.getpid()} {'ok' if ok else 'fail'}")
+os.replace(done.with_suffix(".tmp"), done)
+while not release.exists():
+    time.sleep(0.05)
+"""
+
+
+@pytest.mark.platforms("any")  # Every OS lane: the lock is msvcrt on Windows, flock elsewhere.
+def test_concurrent_processes_never_lose_each_others_ledger_entries(tmp_path):
+    # Every profile process of an install appends to the same root ledger. An in-process lock let
+    # simultaneous read-modify-writes drop each other's entries; each live registrant must remain.
+    ledger, start, release = tmp_path / "spawn-ledger.json", tmp_path / "start", tmp_path / "release"
+    repo = Path(pi.__file__).resolve().parents[1]
+    procs = [subprocess.Popen([sys.executable, "-c", _CONCURRENT_REGISTRAR, str(ledger), str(start), str(release),
+                               str(tmp_path / f"done-{i}")], cwd=repo) for i in range(8)]
+    try:
+        deadline = time.monotonic() + 120
+        while not all((tmp_path / f"done-{i}.ready").exists() for i in range(8)):  # All contend from the start.
+            assert time.monotonic() < deadline, "registrants did not start"
+            assert all(p.poll() is None for p in procs), "a registrant exited early"
+            time.sleep(0.05)
+        start.write_text("go")
+        deadline = time.monotonic() + 120
+        while not all((tmp_path / f"done-{i}").exists() for i in range(8)):
+            assert time.monotonic() < deadline, "registrants did not finish"
+            assert all(p.poll() is None for p in procs), "a registrant exited early"
+            time.sleep(0.1)
+        # A Windows venv python is a launcher whose worker child registers, so each reports its own pid.
+        reports = [(tmp_path / f"done-{i}").read_text().split() for i in range(8)]
+        assert {status for _, status in reports} == {"ok"}
+        assert not (tmp_path / "spawn-ledger.json.corrupt").exists()
+        registered = {e["pid"] for e in json.loads(ledger.read_text(encoding="utf-8"))}
+        assert registered == {int(pid) for pid, _ in reports}
+    finally:
+        # Unblock every phase a child can be waiting in, then reap; never strand a registrant.
+        start.write_text("go")
+        release.write_text("done")
+        for p in procs:
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=30)
+
+
 def test_corrupt_ledger_quarantined_not_rewritten_blind(tmp_path):
     # #89298 contract: corruption is quarantined aside, never treated as [].
     ledger = tmp_path / "spawn-ledger.json"
