@@ -50,7 +50,13 @@ const { $sessionTiles, foregroundSessionScopes, liveSessionScopes, recordSession
   await import('./session-states')
 
 const { stampSecondaryProfileOwner } = await import('./session-event-provenance')
-const { $selectedStoredSessionId, $sessions, setActiveSessionId } = await import('@/store/session')
+const {
+  $selectedStoredSessionId,
+  $sessions,
+  setActiveSessionId,
+  setSessionOwnerHint,
+  _resetSessionOwnerHintsForTests
+} = await import('@/store/session')
 
 function installDesktop(): void {
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
@@ -101,6 +107,8 @@ afterEach(() => {
   $sessions.set([])
   setActiveSessionId(null)
   $selectedStoredSessionId.set(null)
+  _resetSessionOwnerHintsForTests({ storage: true })
+  vi.restoreAllMocks()
   vi.clearAllMocks()
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
 })
@@ -195,6 +203,36 @@ describe('foreground tile retention vs. the live-work pruner (#93892)', () => {
 })
 
 describe('local secondary profile foreground retention across lease release (#121865)', () => {
+  it('retains the exact RPC route as well as a profile-only event source for the foreground chat', async () => {
+    const runtimeId = 'rt-local-owner-handoff'
+    setSessionOwnerHint(runtimeId, { connectionId: 'local', profile: 'alpha' })
+    recordSessionEventScope(stampSecondaryProfileOwner({ session_id: runtimeId } as never, 'alpha'))
+    setActiveSessionId(runtimeId)
+    await openGatewayForAgent('unrelated-source', 'alpha')
+
+    // Events may arrive on the profile-only socket, while the durable owner
+    // routes approvals/resumes over conn:local. Both have foreground consumers.
+    await requestGatewayForAgent('local', 'alpha', 'approval.pending', { session_id: runtimeId })
+    expect(gatewayMocks.closed).toEqual([])
+
+    // More than one keepalive/reap cycle must not close/recreate that route.
+    const startedAt = Date.now()
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      vi.spyOn(Date, 'now').mockReturnValue(startedAt + cycle * 60_000)
+      pruneSecondaryGateways(idleKeepSet())
+      await requestGatewayForAgent('local', 'alpha', 'approval.pending', { session_id: runtimeId })
+      expect(gatewayMocks.closed).toEqual(['wss://unrelated-source.invalid/api/ws?profile=alpha'])
+    }
+    vi.restoreAllMocks()
+
+    setActiveSessionId(null)
+    await requestGatewayForAgent('local', 'alpha', 'approval.pending', { session_id: runtimeId })
+    expect(gatewayMocks.closed).toEqual([
+      'wss://unrelated-source.invalid/api/ws?profile=alpha',
+      'wss://local.invalid/api/ws?profile=alpha'
+    ])
+  })
+
   it('keeps a local secondary profile socket when its session is in foreground across request lease release', async () => {
     const event = stampSecondaryProfileOwner({ session_id: 'rt-jody' } as never, 'jody')
     recordSessionEventScope(event)

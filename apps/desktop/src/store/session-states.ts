@@ -298,8 +298,9 @@ export function _resetSessionOwnerHoldsForTests(): void {
  * source switch briefly changes the active gateway before an idle conversation
  * is cleared, so the primary runtime must survive that handoff. Open panes have
  * the same ownership contract: a non-focused idle tile is still user-visible
- * state and must not be evicted just because another pane has focus. Prefer the
- * live event scope, with the tile's persisted route as the pre-bind fallback.
+ * state and must not be evicted just because another pane has focus. Retain the
+ * live event scope AND the resolved RPC owner route: a profile-only event may
+ * arrive while the durable binding routes requests over an exact connection.
  *
  * A just-created session's owner is named by its create → foreground hold
  * (holdSessionOwnerUntilForeground) until the selected/tiled publication or
@@ -345,10 +346,14 @@ export function foregroundSessionScopes(): Set<string> {
 
     if (scope) {
       scopes.add(scope)
-
-      return
     }
 
+    // The RPC owner ladder prefers an exact durable route over an event's
+    // profile-only route. Retaining just the event socket closes that exact
+    // route as soon as approval.pending/resume releases its request lease:
+    // disconnect → orphan reap → auto-resume → disconnect, while the chat is
+    // still foreground. Use the same owner resolver as those requests; never
+    // infer another connection merely from a matching profile name.
     addOwnerScope(knownOwnerForSession(runtimeId))
   }
 
