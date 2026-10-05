@@ -544,7 +544,9 @@ def _adopt_out_of_band_turns(session: dict) -> None:
     if not newer:
         return
     rewritten = any(row.get("_compressed_summary") for row in newer)
-    rows = _load_durable_truncation_history(session, repair_alternation=rewritten) or []
+    # A busy-queue accept row is not context for this turn: a teammate delivery admitted before the
+    # queued human prompt must not see it (it would anchor on a request nobody has dispatched yet).
+    rows = _load_durable_truncation_history(session, repair_alternation=rewritten, exclude_queued=True) or []
     keep = _below_ceiling if rewritten else _foreign
     tail = canonicalize_replay_history([m for m in rows if keep(_message_row_id(m))])
     if not tail:
@@ -577,7 +579,7 @@ def _adopt_store_tail_without_row_ids(session: dict, history: list, version: int
     is re-hydrated from the DB like the stamped path does — a positional check alone would keep it because
     the compacted store is shorter.
     """
-    rows = [m for m in _load_durable_truncation_history(session, repair_alternation=True) or []
+    rows = [m for m in _load_durable_truncation_history(session, repair_alternation=True, exclude_queued=True) or []
             if below_ceiling(_message_row_id(m))]
     if not history:
         return
@@ -728,7 +730,19 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     if take_speech_interrupted():
         run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
     run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+    run_message = _prepend_note(run_message, _delivery_status_note(session, run_message))
     return prompt, _prepend_note(run_message, _hud_surface_note(session)), cols, streamer
+
+
+def _delivery_status_note(session: dict, run_message: Any = "") -> str:
+    """Bot Chat: outgoing deliveries the recipient finished silently, announced once as model input
+    (their status-only receipts were settled without a turn; the persisted prompt is untouched)."""
+    # Native-image list overrides strip API-only text without preserving a wire sidecar.
+    # Leave notes pending until a string turn can persist/replay them without changing history.
+    if not isinstance(run_message, str) or not _is_bot_mode_session(session):
+        return ""
+    from tools.bot_receipt_policy import take_status_note
+    return take_status_note(_session_home(session), _submit_row_target_key(session))
 
 
 def _invoke_agent(
@@ -933,8 +947,11 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         except Exception:
             _error_surface = None
     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
+    silent = False
     if _is_bot_mode_session(session):
-        raw = _bot_mode_delivery_text(raw, successful=status == "complete")
+        delivered = _bot_mode_delivery_text(raw, successful=status == "complete")
+        # Exact-marker silence and an empty turn both deliver "": only the receipt knows which.
+        silent, raw = delivered == "" and raw != "", delivered
     payload = {"text": raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
@@ -991,6 +1008,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         st.terminal_callback({
             "status": {"interrupted": "cancelled", "error": "failed"}.get(status, "settled"),
             "text": raw if isinstance(raw, str) else str(raw),
+            **({"silent": True} if silent else {}),
             **({"error": str(error_value or raw)} if status == "error" else {})})
         st.receipt_committed = True
     if st.receipt_committed:

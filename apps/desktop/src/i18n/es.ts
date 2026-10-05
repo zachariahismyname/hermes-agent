@@ -5606,8 +5606,8 @@ export const esOverrides = {
           body: 'La respuesta repetía los mismos pasos, así que Hermes la detuvo. Reinténtalo o empieza un chat nuevo si vuelve a ocurrir.'
         },
         SESSION_NOT_OWNED: {
-          title: 'Este chat está abierto en otro sitio',
-          body: 'Este chat está abierto en otra ventana de Hermes o en un terminal. Ciérralo allí y vuelve a enviar el mensaje, o empieza un chat nuevo aquí.'
+          title: 'Este chat está en uso',
+          body: 'Otra sesión de Hermes o un agente en segundo plano está usando este chat. Tu mensaje no se ha aceptado. Conserva el borrador y vuelve a enviarlo aquí cuando termine ese trabajo.'
         },
         disk_full: {
           title: 'Disco lleno',

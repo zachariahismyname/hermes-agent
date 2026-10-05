@@ -14,6 +14,7 @@ when the target is definitively offline (fail fast instead of queueing a DM nobo
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 from tools.bot_mode_probe import _default_home, _hermes_root, alias_forms
-from utils import atomic_json_write
+from utils import atomic_json_write, read_text_contended
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,7 @@ def write_remote_roster(root: Path | str, rows: Any) -> int:
 def read_remote_roster(root: Path | str) -> list[dict]:
     """The current remote roster (possibly empty). Never raises."""
     try:
-        raw = (relay_root(root) / ROSTER_FILE).read_text(encoding="utf-8-sig")
+        raw = read_text_contended(relay_root(root) / ROSTER_FILE)  # Contention must not read as an empty roster.
         data = json.loads(raw)
         agents = data.get("agents") if isinstance(data, dict) else None
         return [r for r in map(_normalize_roster_row, agents) if r] if isinstance(agents, list) else []
@@ -613,7 +614,7 @@ def delivery_env(author: Optional[dict], profile_home: "str | Path | None" = Non
 
 # Two deliveries into the SAME profile must never run Bot Chat turns concurrently.
 # Deliveries are separate ``hermes`` subprocesses, so the lock is a per-profile
-# lockfile under ``<root>/bot_relay/locks/`` held with ``fcntl.flock`` for exactly
+# lockfile under ``<root>/bot_relay/locks/`` held with a kernel file lock for exactly
 # the turn window; the kernel releases it on fd close (incl. process death), so a
 # crashed turn can never wedge the profile.
 
@@ -621,7 +622,7 @@ def delivery_env(author: Optional[dict], profile_home: "str | Path | None" = Non
 # ── per-profile turn lock (#93091) ─────────────────────────────────────────── Two deliveries into the SAME
 # target profile must never run their Bot Chat turns concurrently: deliveries spawn separate ``hermes``
 # subprocesses, so an in-memory mutex is useless — the lock is a per-profile lockfile under
-# ``<root>/bot_relay/locks/`` held with ``fcntl.flock`` for exactly the turn execution window. flock is
+# ``<root>/bot_relay/locks/`` held with a kernel file lock for exactly the turn execution window. It is
 # released by the kernel when the holder's fd closes (including process death), so a crashed turn can never
 # wedge the profile. A queued delivery waits up to ``bot_mode.turn_wait_seconds`` and then fails with a
 # structured 'target_busy' refusal instead of blocking forever.
@@ -653,19 +654,27 @@ def turn_lock_path(root: Path | str, profile: str) -> Path:
     return relay_root(root) / LOCKS_DIR / f"{safe}.lock"
 
 
+def _turn_lock_fd(fd: int, *, acquire: bool) -> None:
+    from hermes_platform.host.facts import os_family
+
+    if os_family() == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if acquire else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if acquire else fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | None = None) -> Iterator[Path]:
     """Hold ``profile``'s cross-process turn lock for the ``with`` body: non-blocking
-    flock probe + short-sleep retry up to the budget (``bot_mode.turn_wait_seconds``
+    lock probe + short-sleep retry up to the budget (``bot_mode.turn_wait_seconds``
     unless ``timeout_seconds``); raises :class:`TurnBusyError` when exhausted. No
-    ordering among waiters, but every waiter is bounded. Without ``fcntl`` (Windows)
-    the lock is a no-op — those installs never had this race path."""
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover — Windows
-        logger.debug("bot turn lock disabled: fcntl unavailable on this platform")
-        yield turn_lock_path(root, profile)
-        return
+    ordering among waiters, but every waiter is bounded. Native Windows uses a
+    byte-range lock; both platforms release ownership when the process exits."""
 
     budget = turn_wait_seconds() if timeout_seconds is None else max(0.0, float(timeout_seconds))
     path = turn_lock_path(root, profile)
@@ -676,9 +685,11 @@ def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | N
         deadline = start + budget
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _turn_lock_fd(fd, acquire=True)
                 break
-            except OSError:
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK}:
+                    raise
                 now = time.monotonic()
                 if now >= deadline:
                     raise TurnBusyError(profile, now - start)
@@ -687,6 +698,6 @@ def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | N
             yield path
         finally:
             with contextlib.suppress(OSError):  # kernel releases on close anyway
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _turn_lock_fd(fd, acquire=False)
     finally:
         os.close(fd)

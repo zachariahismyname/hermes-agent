@@ -62,6 +62,32 @@ def test_quiet_one_shot_consumes_the_variable_before_the_turn(monkeypatch):
     assert TURN_AUTHOR_ENV not in os.environ
 
 
+def test_bot_result_is_not_replaced_or_reauthored_by_later_ack(monkeypatch, capsys):
+    from hermes_cli import quiet_single_query
+    seen = []
+    def conversation(**kwargs):
+        seen.append(kwargs)
+        return {"final_response": "original task result" if len(seen) == 1 else "acknowledged"}
+    def continue_once(_key, turn, **kwargs):
+        return turn("receipt of a different delivery")
+    monkeypatch.setattr(quiet_single_query, "continue_quiet_notify_completions", continue_once)
+    _run(monkeypatch, json.dumps(AUTHOR), conversation)
+    assert capsys.readouterr().out.strip() == "original task result"
+    assert seen[0]["turn_author"] == AUTHOR
+    assert "turn_author" not in seen[1]
+
+
+def test_human_quiet_query_can_return_durable_mailbox_followup(monkeypatch):
+    from hermes_cli.quiet_single_query import continue_quiet_notify_completions
+    from tools.process_registry import process_registry
+    monkeypatch.setattr(process_registry, "wait_for_pending_completions", lambda *_a, **_kw: {})
+    monkeypatch.setattr(process_registry, "drain_notifications", lambda **_kw: [])
+    results = iter([{"final_response": "child's substantive result"}, None])
+    result = continue_quiet_notify_completions("synthetic", lambda *_: None, linger_budget=0,
+                                             idle_work=lambda: next(results))
+    assert result["final_response"] == "child's substantive result"
+
+
 def test_quiet_one_shot_resumes_nested_notify_on_this_session_not_parent(monkeypatch, capsys):
     """A nested Bot Mode completion keyed to B wakes B even when the parent env still names A.
 

@@ -5616,8 +5616,8 @@ export const deOverrides = {
           body: 'Die Antwort hat dieselben Schritte wiederholt, daher hat Hermes sie gestoppt. Versuchen Sie es erneut oder starten Sie einen neuen Chat, wenn es wieder passiert.'
         },
         SESSION_NOT_OWNED: {
-          title: 'Dieser Chat ist woanders offen',
-          body: 'Dieser Chat ist gerade in einem anderen Hermes-Fenster oder Terminal geöffnet. Schließen Sie ihn dort und senden Sie Ihre Nachricht erneut, oder starten Sie hier einen neuen Chat.'
+          title: 'Dieser Chat wird gerade verwendet',
+          body: 'Eine andere Hermes-Sitzung oder ein Agent im Hintergrund verwendet diesen Chat. Ihre Nachricht wurde nicht angenommen. Behalten Sie Ihren Entwurf und senden Sie ihn hier erneut, sobald die Arbeit abgeschlossen ist.'
         },
         disk_full: {
           title: 'Festplatte voll',

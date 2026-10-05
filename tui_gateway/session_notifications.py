@@ -647,9 +647,21 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
                 or owner.get("session_id") != session.get("session_key")):
             return False
         # The mailbox matches each envelope to this pinned lease/live id and compression lineage.
-        claimed = claim_pending_delivery(home, owner)
-        if claimed is None:
-            return False
+        # Status-only receipts are settled in this same pass (their note reaches the model on
+        # the next real turn), so a burst of them does not cost one poll interval each.
+        from tools.bot_receipt_policy import MAX_PASSIVE_PER_PASS, settle_passive_receipt
+        passive = 0
+        while True:
+            claimed = claim_pending_delivery(home, owner, recover_unclaimed=True)
+            if claimed is None:
+                return passive > 0
+            if (original_id := settle_passive_receipt(home, claimed)) is None:
+                break
+            passive += 1
+            _emit("status.update", sid, {"kind": "bot_delivery",
+                  "text": f"Delivery {original_id} completed without a reply; status noted for the next turn."})
+            if passive >= MAX_PASSIVE_PER_PASS:
+                return True
         session["running"] = True
 
     delivery_id = str(claimed["id"])
@@ -658,6 +670,9 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
         status = str(terminal.get("status") or "failed")
         error = str(terminal.get("error") or "")
         reason = "cancelled" if status == "cancelled" else ""
+        if status == "settled" and terminal.get("silent") is True:
+            from tools.bot_receipt_policy import SILENCE_REASON
+            reason = SILENCE_REASON
         if status not in {"settled", "cancelled"}:
             from tools.bot_failure_reasons import classify_agent_error
             reason = classify_agent_error(error)
@@ -736,6 +751,12 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         async_delegation.maybe_sweep_orphaned_completions(queue)
         if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
             last_bot_poll = now
+            from tools.bot_delivery_outbox import poll_outgoing, sweep_install_outgoing
+            try:
+                poll_outgoing(_session_home(session), _submit_row_target_key(session))
+                sweep_install_outgoing(_session_home(session))
+            except Exception as exc:
+                _notif_log_failure("delivery receipt recovery failed", exc)
             _poll_bot_live_delivery_guarded(sid, session, now)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.

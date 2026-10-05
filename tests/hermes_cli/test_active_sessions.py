@@ -491,6 +491,11 @@ def test_unknown_sibling_liveness_only_fences_its_own_session(tmp_path, monkeypa
         "pid": 1, "process_start_time": 1234.5, "track_liveness": True,
     }])
     original_start = active_sessions._process_start_time
+    # PID 1 is not guaranteed to exist on Windows. This scenario is explicitly
+    # an existing process whose start time is unreadable, not a dead owner.
+    from gateway import status
+    original_exists = status._pid_exists
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True if int(pid) == 1 else original_exists(pid))
     monkeypatch.setattr(
         active_sessions, "_process_start_time",
         lambda pid: None if int(pid) == 1 else original_start(pid),
@@ -525,6 +530,9 @@ def test_unknown_sibling_does_not_block_guarded_release_or_orphan_sweep(tmp_path
         "pid": 1, "process_start_time": 1234.5, "track_liveness": True,
     }])
     original_start = active_sessions._process_start_time
+    from gateway import status
+    original_exists = status._pid_exists
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True if int(pid) == 1 else original_exists(pid))
     monkeypatch.setattr(
         active_sessions, "_process_start_time",
         lambda pid: None if int(pid) == 1 else original_start(pid),

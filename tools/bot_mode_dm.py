@@ -48,6 +48,8 @@ REPLY_COMPLETION_CHARS = MESSAGE_MAX_CHARS + 2000
 # the machine dies between spawn ack and the runner's finally.
 _DM_DIR_NAME = "hermes-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
+# Per-payload lock serializing transport selection between concurrent runners (_run_delivery).
+_TRANSPORT_LOCK_SUFFIX = ".transport.lock"
 _LIVE_WAIT_SECONDS = 300
 # A live owner may run a turn past one wait window, but each waiting runner holds ~46 MB and the
 # sender's notify slot: past this the runner reports pending (do not resend) and exits.
@@ -71,16 +73,19 @@ def message_agent_tool_schema() -> dict:
         "function": {
             "name": MESSAGE_AGENT_TOOL_NAME,
             "description": (
-                "Send a message to ANOTHER agent (teammate) on this install, or to an "
-                "agent on a registered peer gateway. This is FIRE-AND-FORGET and "
+                "Send a NEW message to ANOTHER agent (teammate) on this install, or to an "
+                "agent on a registered peer gateway. Never use it to answer a teammate's "
+                "message: your final answer to that message already goes back to them. "
+                "This is FIRE-AND-FORGET and "
                 "asynchronous, like texting: it validates the target against the live "
                 "roster, delivers your message into that agent's own Bot Chat with your "
                 "attribution automatically prefixed, and returns immediately with a "
                 "dispatch acknowledgement — status queued plus a delivery_id (the hand-off to a background "
                 "delivery process, not a delivery receipt). It does NOT return their reply and you must "
-                "not wait or poll for one — send it, finish your turn, and that process's "
-                "completion notification wakes you with the outcome: their reply, or the "
-                "delivery failure — unless the ack returns reply_delivery=\"poll\", in which case "
+                "not wait or poll for one — send it, finish your turn, and the outcome "
+                "(their reply, or the delivery failure) wakes you later; a teammate that "
+                "finishes without replying may only be noted at your next turn — unless the "
+                "ack returns reply_delivery=\"poll\", in which case "
                 "follow its process(action=\"wait\") instruction before ending the turn. COMPOSE the message yourself: write what YOU want to say to "
                 "that agent (lead with the point; include the concrete ask or result). "
                 "Never paste the user's words verbatim — paraphrase the actionable "
@@ -370,13 +375,27 @@ def cleanup_bot_dm_cache(max_age_hours: float = _DM_STALE_SECONDS / 3600, *, now
     with contextlib.suppress(OSError):
         dm_dir = _dm_dir()
         locations.append((dm_dir, "*.txt"))
-        # Live-delivery intents (``<dm file>.live.json``, message plaintext included) outlive
-        # their runner on purpose — a retry replays the same delivery id from them — so the
-        # orphans of runners that never settled are swept here too.
-        locations.append((dm_dir, "*.live.json"))
-    from tools.bot_relay import unlink_files_older_than
-
-    return sum(unlink_files_older_than(d, pattern, cutoff) for d, pattern in locations)
+    removed = 0
+    for directory, pattern in locations:
+        for path in directory.glob(pattern):
+            # Pending intents/evidence are durable work, not expired cache entries.
+            if (Path(str(path) + '.live.json').exists()
+                    or Path(str(path) + '.pending.json').exists()):
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except FileNotFoundError:
+                pass
+        # A transport lock outlives nothing it guards: sweep stale ones whose payload is gone.
+        for lock in directory.glob(pattern + _TRANSPORT_LOCK_SUFFIX):
+            try:
+                if not Path(str(lock)[:-len(_TRANSPORT_LOCK_SUFFIX)]).exists() and lock.stat().st_mtime < cutoff:
+                    lock.unlink()
+            except OSError:
+                pass
+    return removed
 
 
 def _unlink_dm_file(path: str) -> None:
@@ -420,7 +439,19 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     return acquire_turn_lock(_hermes_root(Path(_default_home())), argv[2])
 
 
-def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
+class _SessionOwnershipRefused(RuntimeError):
+    """The CLI explicitly refused before executing the input; safe to enqueue it — unless
+    ``prior_attempt_ran``: the policy retry was refused after an earlier attempt of the SAME
+    payload already ran (and may have had effects), so the outcome is unknown and the payload
+    must never be handed to another owner or retried."""
+
+    def __init__(self, message: str, *, prior_attempt_ran: bool = False):
+        super().__init__(message)
+        self.prior_attempt_ran = prior_attempt_ran
+
+
+def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
+                    emit_output: bool = True) -> int:
     """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); re-emits
     the transport's streams and returns its exit code. Transient failures re-run the
     same session; a context_overflow re-run lets the retried turn's pre-API compaction
@@ -430,34 +461,24 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env)
 
+    from tools.bot_failure_reasons import session_ownership_refused
+
     proc = _turn()
+    prior_attempt_ran = False
     if proc.returncode != 0:
         from tools.bot_failure_reasons import RETRY_NONE, classify_agent_error, retry_action, turn_failure_text
         from tools.bot_relay import retry_turn_env
 
         # The re-run replays the same session and payload; the failed attempt already persisted the
         # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
-        if retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
+        from hermes_cli.quiet_mailbox import DELIVERY_ID_ENV
+        if not (env or {}).get(DELIVERY_ID_ENV) and retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
+            # A first attempt that was not itself a pre-execution refusal may have run the turn.
+            prior_attempt_ran = not session_ownership_refused(proc.returncode, proc.stderr)
             proc = _turn(retry_turn_env(env))
-    stderr_text = proc.stderr or ""
-    reason = next((line.removeprefix("hermes-refusal-reason: ").strip()
-                   for line in stderr_text.splitlines()
-                   if line.startswith("hermes-refusal-reason: ")), None)
-    # A code wins over prose, including unknown codes from newer CLIs.
-    # Only older CLIs without a marker need the historical wording fallback.
-    refused_not_owned = (reason == "SESSION_NOT_OWNED" if reason is not None
-                         else "already has a live owner" in stderr_text)
-    if proc.returncode != 0 and refused_not_owned:
-        # The target's Bot Chat is held live by another surface (Desktop); the turn
-        # never ran — tell the sender plainly instead of leaking a raw lease error.
-        # See #100523.
-        who = argv[argv.index("-p") + 1] if "-p" in argv[:-1] else "the teammate"
-        print(json.dumps({
-            "error": f"Delivery failed: @{who}'s Bot Chat is open on another "
-                     "surface right now, so your message was NOT delivered. Try again later.",
-            "reason": "target_busy",
-        }))
-        return 1
+
+    if session_ownership_refused(proc.returncode, proc.stderr):
+        raise _SessionOwnershipRefused('Another turn owns the target Bot Chat.', prior_attempt_ran=prior_attempt_ran)
     # Re-emit the transport's streams: stdout is the reply text the
     # completion notification carries back to the sending agent. A successful bare
     # silence marker is a delivery decision (same rule as the gateway and the live
@@ -468,7 +489,7 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
     if proc.returncode == 0 and is_intentional_silence_response(reply):
         reply = ""
     for stream, text in ((sys.stdout, reply), (sys.stderr, proc.stderr)):
-        if text:
+        if text and emit_output:
             stream.write(text)
             stream.flush()
     return proc.returncode
@@ -485,7 +506,8 @@ def _dm_delivery_id(dm_file: "str | os.PathLike") -> str:
     return hashlib.sha256(str(Path(dm_file).resolve()).encode()).hexdigest()
 
 
-def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None) -> dict | None:
+def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None,
+                   *, include_busy_owner: bool = False, admit_ownerless: bool = False) -> dict | None:
     """Pin intent before admission; retries may inspect, never change transport."""
     from tools.bot_live_delivery import deliver_to_live_owner, find_canonical_live_owner, read_delivery_result
     from utils import fsync_directory
@@ -497,6 +519,16 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     else:
         assert profile_home is not None
         owner = find_canonical_live_owner(profile_home)
+        if owner is None and include_busy_owner:
+            from tools.bot_live_delivery import find_canonical_owner
+
+            busy = find_canonical_owner(profile_home)
+            if busy:
+                owner = {key: busy[key] for key in ('profile_home', 'session_id', 'lease_id')}
+                owner['live_session_id'] = (busy.get('metadata') or {}).get('live_session_id') or 'deferred-cli'
+        if owner is None and admit_ownerless:
+            from tools.bot_mailbox_recovery import canonical_unowned_target
+            owner = canonical_unowned_target(profile_home)
         if owner is None:
             return None
         intent = dict(owner=owner, message=Path(dm_file).read_text(encoding="utf-8-sig"),
@@ -520,16 +552,37 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     return record
 
 
-def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | None" = None) -> int:
+def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | None" = None,
+                  argv: list[str] | None = None, author: Optional[dict] = None) -> int:
     from tools.bot_failure_reasons import RUNTIME_OFFLINE
-    from tools.bot_live_delivery import await_delivery, cancel_queued_delivery, owner_holds_delivery
+    from tools.bot_live_delivery import (
+        await_delivery, cancel_queued_delivery, owner_holds_delivery, read_delivery_result)
+    from tools.bot_mailbox_recovery import recover_without_owner
+
+    def recover(record) -> bool:
+        # A queued ticket whose canonical chat has no owner is delivered from the durable
+        # mailbox by a quiet CLI consumer instead of being cancelled. Runs the turn; True
+        # only when that consumer actually ran. While it runs, this runner is no longer
+        # waiting on someone else's turn: it executes the delivery exactly like the CLI
+        # transport in _run_delivery (same _run_local_turn), so the wait bounds below, which
+        # exist for waiting on a live owner, do not apply to that turn; afterwards the record
+        # is terminal or claimed and the loop ends within its deadline.
+        return bool(record and record["status"] == "queued" and argv is not None and dm_file is not None
+                    and recover_without_owner(home, delivery_id, argv, str(dm_file), author=author))
 
     deadline = time.monotonic() + _LIVE_WAIT_MAX_SECONDS
+    window_end = time.monotonic() + _LIVE_WAIT_SECONDS
     missed = 0
     while True:
-        record = await_delivery(home, delivery_id, max(0.0, min(_LIVE_WAIT_SECONDS, deadline - time.monotonic())))
+        recover(read_delivery_result(home, delivery_id))
+        # Short polls keep recovery prompt; never past the owner-check window or the deadline.
+        now = time.monotonic()
+        record = await_delivery(home, delivery_id, max(0.0, min(0.5, window_end - now, deadline - now)))
         if record is None or record["status"] not in ("queued", "claimed") or time.monotonic() >= deadline:
             break
+        if time.monotonic() < window_end:
+            continue
+        window_end = time.monotonic() + _LIVE_WAIT_SECONDS
         try:
             held = owner_holds_delivery(home, record)
         except Exception:
@@ -539,6 +592,9 @@ def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | 
             missed = 0
             continue
         if held is False and record["status"] == "queued":
+            if recover(record):
+                missed = 0
+                continue
             # Under the same mailbox lock as claim, either cancellation wins or
             # the claim wins and we must keep waiting for its outcome.
             record = cancel_queued_delivery(
@@ -564,6 +620,8 @@ def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | 
         # plaintext) — the live branch returns before _run_delivery's own unlink.
         _unlink_dm_file(_live_intent_file(dm_file))
         _unlink_dm_file(str(dm_file))
+        _unlink_dm_file(str(dm_file) + '.pending.json')
+        _unlink_dm_file(str(dm_file) + _TRANSPORT_LOCK_SUFFIX)
     print(json.dumps(payload))
     return 0 if status in ("settled", "queued", "claimed") else 1
 
@@ -615,30 +673,91 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
     gateway's deliver path, not here.
     """
     # The live consumer owns turn admission; never compete for its CLI lease.
-    if not stdin_file:
-        home = profile_home or _local_delivery_home(argv)
-        if home is not None or os.path.exists(_live_intent_file(dm_file)):
-            try:
-                record = _admit_live_dm(home, dm_file, author)
-            except Exception as exc:
-                print(_live_outcome_unknown(dm_file, exc))
+    home = profile_home or (_local_delivery_home(argv) if not stdin_file else None)
+    pending_path = Path(str(dm_file) + '.pending.json')
+    from hermes_cli.active_sessions import _FileLock
+    from utils import atomic_json_write
+
+    # Transport selection is one atomic step per payload: [reconciliation check -> live admission ->
+    # CLI reservation] under a per-payload lock. Otherwise two runners could both pass the checks, one
+    # reserving the payload for a direct CLI turn (whose quiet CLI advertises a mailbox) while the other
+    # admits the same payload to that mailbox, and the CLI would execute it twice.
+    try:
+        with _FileLock(Path(str(dm_file) + _TRANSPORT_LOCK_SUFFIX)):
+            if pending_path.exists() and not Path(_live_intent_file(dm_file)).exists():
+                print(_live_outcome_unknown(dm_file, 'A previous transport attempt needs reconciliation'))
                 return 1
-            if record is not None:
-                return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+            record = None
+            if not stdin_file and (home is not None or os.path.exists(_live_intent_file(dm_file))):
+                try:
+                    record = _admit_live_dm(home, dm_file, author)
+                except Exception as exc:
+                    print(_live_outcome_unknown(dm_file, exc))
+                    return 1
+            if record is None:
+                # Reserve this attempt exclusively before a CLI turn may start. A crash before the
+                # full marker is published still fails closed on retry.
+                try:
+                    fd = os.open(pending_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError:
+                    print(_live_outcome_unknown(dm_file, 'Another transport attempt owns this payload'))
+                    return 1
+                os.close(fd)
+                atomic_json_write(pending_path,
+                                  {'delivery_id': _dm_delivery_id(dm_file), 'profile_home': str(home) if home else None,
+                                   'status': 'requires_reconciliation'}, mode=0o600, fsync_dir=True)
+    except RuntimeError as exc:  # the per-payload lock itself was unavailable: nothing was admitted
+        print(_live_outcome_unknown(dm_file, exc))
+        return 1
+    if record is not None:
+        return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file, argv=argv, author=author)
+    consumed = False
     try:
         from tools.bot_relay import delivery_env
 
         env = delivery_env(author, profile_home if not stdin_file else None)
         with _delivery_lock(argv, stdin_file=stdin_file):
             if not stdin_file:
-                return _run_local_turn(argv, dm_file, env=env)
-            # Keep the file open until the transport exits; cleanup occurs
-            # after subprocess.run returns, not merely after stdin reaches EOF.
-            with open(dm_file, "r", encoding="utf-8-sig") as stream:
-                # Passing the file descriptor as stdin bypasses the BOM-aware decoder.
-                return subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
+                # A Desktop owner may have appeared while this runner waited for the lock.
+                record = _admit_live_dm(home, dm_file, author) if home is not None else None
+                if record is None:
+                    result = _run_local_turn(argv, dm_file, env=env)
+                    consumed = result == 0
+                    return result
+            else:
+                with open(dm_file, "r", encoding="utf-8-sig") as stream:
+                    result = subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
+                consumed = result == 0
+                return result
+        # Never hold the CLI delivery lock while waiting for the live consumer.
+        return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file, argv=argv, author=author)
+    except Exception as exc:
+        from tools.bot_relay import TurnBusyError
+
+        if not isinstance(exc, (_SessionOwnershipRefused, TurnBusyError)):
+            raise
+        if getattr(exc, "prior_attempt_ran", False):
+            # An earlier attempt of this payload ran before the retry was refused: its effects are
+            # unknown. Keep the reservation and payload for reconciliation; never hand it to the
+            # live owner (that would execute it again) and never report "no turn executed".
+            print(_live_outcome_unknown(dm_file, 'an earlier attempt ran before the retry was refused'))
+            return 1
+        record = _admit_live_dm(home, dm_file, author, include_busy_owner=True) if home is not None else None
+        if record is not None:
+            return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file, argv=argv, author=author)
+        print(json.dumps({'status': 'not_delivered', 'reason': 'target_busy',
+                          'delivery_id': _dm_delivery_id(dm_file), 'evidence_file': dm_file,
+                          'error': 'Another turn held the target session. Payload retained; no turn executed.'}))
+        # A proven pre-execution refusal is not an unknown outcome: keep the payload as evidence,
+        # but drop the attempt reservation so a deliberate retry is not refused as "needs
+        # reconciliation" forever.
+        _unlink_dm_file(str(pending_path))
+        return 1
     finally:
-        _unlink_dm_file(dm_file)
+        if consumed:
+            _unlink_dm_file(dm_file)
+            _unlink_dm_file(str(pending_path))
+            _unlink_dm_file(str(dm_file) + _TRANSPORT_LOCK_SUFFIX)
 
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
@@ -667,16 +786,32 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
     dm_file = _write_dm_file(content)
     if profile_home is not None:
         try:
-            record = _admit_live_dm(profile_home, dm_file, author)
+            record = _admit_live_dm(profile_home, dm_file, author, include_busy_owner=True, admit_ownerless=True)
         except Exception as exc:
             return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
                 "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
                 "evidence_file": dm_file})
         if record is not None:
+            from tools.bot_delivery_outbox import register_outgoing, sender_consumes_receipts
+            try:
+                # A receipt is a usable return path only for an advertised mailbox consumer;
+                # otherwise keep the upstream completion-notification / poll path (no index, so
+                # no second copy of the reply arrives later as a receipt).
+                durable_reply = (sender_consumes_receipts(agent)
+                                 and register_outgoing(agent, record, argv, dm_file, author))
+            except Exception as exc:
+                # Recipient admission may already have caused effects. Never turn
+                # a sender-index failure into permission to send a second ticket.
+                return json.dumps(dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
+                    notification_error=str(exc), evidence_file=dm_file,
+                    detail="Recipient admission is retained, but reply tracking failed. Do not resend; inspect this delivery ID."))
             command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
-            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent))
+            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent,
+                                                      durable_reply=durable_reply))
             result = dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
-                          detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn.")
+                          detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn."
+                          + (" A reply or failure arrives as a delivery receipt; a silent completion may only be noted "
+                             "at the start of your next turn." if durable_reply else ""))
             if notification.get("error"):
                 result["notification_error"] = notification["error"]
             elif notification.get("process_id"):
@@ -696,7 +831,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
 
 
 def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, delivery_id: Optional[str] = None,
-                    task_id: Optional[str], agent: Any) -> str:
+                    task_id: Optional[str], agent: Any, durable_reply: bool = False) -> str:
     """Launch the cleanup-owning runner and transfer file ownership on ack. ``dm_file``
     is None for relay deliveries (the waiter watches a reply file; envelope artifacts
     are owned/swept by ``tools/bot_relay.py``), which pass the envelope id as ``delivery_id``
@@ -706,7 +841,7 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
     try:
         from tools.terminal_tool import terminal_tool
 
-        raw = terminal_tool(command, background=True, notify_on_complete=True, task_id=task_id,
+        raw = terminal_tool(command, background=True, notify_on_complete=not durable_reply, task_id=task_id,
                             workdir=str(Path(__file__).resolve().parent.parent), _host_local=True,
                             _completion_output_chars=REPLY_COMPLETION_CHARS)
         try:
@@ -726,7 +861,10 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From here the background runner owns the file (removed after the consumer finishes).
         transferred = True
-        if parsed.get("notify_on_complete") is False:
+        if durable_reply:
+            detail = ("Durably queued. Finish your turn; a reply or failure arrives as a separate receipt, "
+                      "a silent completion may only be noted on your next turn. Do not resend.")
+        elif parsed.get("notify_on_complete") is False:
             # terminal_tool refused the completion promise: this session (api_server, one-shot
             # runner) cannot receive an async completion, so the recipient's reply would never
             # be injected here (#101142). Say so and name the return path the surface supports.
@@ -749,7 +887,7 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
             "status": "queued",
             "delivery_id": delivery_id or (_dm_delivery_id(dm_file) if dm_file else ""),
             "to": label,
-            "reply_delivery": "poll" if parsed.get("notify_on_complete") is False else "notification",
+            "reply_delivery": "poll" if not durable_reply and parsed.get("notify_on_complete") is False else "notification",
             "detail": detail,
             "process_id": proc_id,
             "queued_at": int(time.time()),

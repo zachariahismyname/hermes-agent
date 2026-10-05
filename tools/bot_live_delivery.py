@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from utils import atomic_json_write, atomic_write_text, fsync_directory
+from utils import atomic_json_write, atomic_write_text, fsync_directory, read_text_contended
 from pathlib import Path
 from typing import Any, Callable
 
@@ -107,10 +107,16 @@ def _locked(home: Path | str):
         yield root
 
 
-def _read(path: Path) -> dict[str, Any] | None:
-    """Exact-id read: absent → None; unreadable or not a JSON object → raises (callers fail closed)."""
+def _read(path: Path, *, ride_out_contention: bool = True) -> dict[str, Any] | None:
+    """Exact-id read: absent → None; unreadable or not a JSON object → raises (callers fail closed).
+
+    Tickets are read without the dir lock while other processes atomically replace them; on Windows
+    that read can hit a transient sharing violation, which used to abort a whole receipt-recovery pass
+    or the sender's ``await_delivery`` wait (S4 soak-05). ``read_text_contended`` rides it out. Bulk
+    scans opt out: they run under the dir lock and already skip an unreadable ticket until the next
+    pass, so a per-ticket budget would multiply across the directory."""
     try:
-        record = json.loads(path.read_text(encoding="utf-8-sig"))
+        record = json.loads(read_text_contended(path) if ride_out_contention else path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return None
     if not isinstance(record, dict):
@@ -156,7 +162,7 @@ def _scan_read(path: Path) -> dict[str, Any] | None:
     licensing an overwrite of a possibly-live receipt.
     """
     try:
-        record = _read(path)
+        record = _read(path, ride_out_contention=False)
         problem = None if record is None else _ticket_shape_error(path, record)
     except (OSError, ValueError) as exc:  # ValueError: corrupt JSON and invalid UTF-8 alike
         record, problem = None, str(exc)
@@ -240,36 +246,78 @@ def _matches(home: Path | str, record: dict, owner: dict) -> bool:
         db.close()
 
 
+def _adoptable(profile_home: Path | str, record: dict, owner: dict, active_leases: set) -> bool:
+    """Restart recovery: a successor canonical owner may adopt a queued record whose pinned lease is
+    gone, when the record rebound to the successor's lease is still the same conversation."""
+    if record["owner"]["lease_id"] in active_leases:
+        return False
+    rebound = dict(record, owner={**record["owner"], "lease_id": owner["lease_id"],
+                                 "live_session_id": owner["live_session_id"]})
+    return _matches(profile_home, rebound, owner)
+
+
 def owner_holds_delivery(profile_home: Path | str, record: dict) -> bool:
-    """Whether the canonical live owner is still one that could claim ``record``."""
+    """Whether the canonical live owner is still one that could claim ``record``: its pinned owner, or
+    a successor that would adopt a still-queued record under :func:`claim_pending_delivery`'s rule."""
     owner = find_canonical_live_owner(profile_home)
-    return owner is not None and _matches(profile_home, record, owner)
+    if owner is None:
+        return False
+    if _matches(profile_home, record, owner):
+        return True
+    claimant = record.get("claimed_owner")
+    if record.get("status") == "claimed" and isinstance(claimant, dict):
+        # Adopted by a successor: the admission owner stays immutable, the claimant runs the turn.
+        return _matches(profile_home, dict(record, owner=claimant), owner)
+    if record.get("status") != "queued":
+        return False
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    active = {entry["lease_id"] for entry in active_session_registry_snapshot(registry_home=profile_home)}
+    return _adoptable(profile_home, record, owner, active)
 
 
 def claim_pending_delivery(
-    profile_home: Path | str, owner: dict[str, Any],
+    profile_home: Path | str, owner: dict[str, Any], *, recover_unclaimed: bool = False,
 ) -> dict[str, Any] | None:
     """Claim oldest matching input exactly once; caller supplies its current lease.
 
-    A lease transfer across compression is accepted only along the original
-    stored session's compression chain. A new lease/live session cannot steal it.
+    A lease transfer across compression is accepted along the original session's
+    chain. Restart recovery requires the verified current canonical live owner
+    and an absent original lease. Claimed work is never replayed.
     Caller must hold its normal turn-admission guard before invoking this.
     """
     current = _owner(profile_home, owner)
     if not _root(profile_home).is_dir():
         return None
     with _locked(profile_home) as root:
+        recovery_owner = None
+        active_leases = set()
+        if recover_unclaimed and find_canonical_live_owner(profile_home) == current:
+            from hermes_cli.active_sessions import active_session_registry_snapshot
+
+            recovery_owner = current
+            active_leases = {entry["lease_id"] for entry in active_session_registry_snapshot(registry_home=profile_home)}
         pending = []
         for path in root.glob("*.json"):
             record = _scan_read(path)
-            if record is not None and record["status"] == "queued" and _matches(profile_home, record, current):
+            if record is None or record["status"] != "queued":
+                continue
+            if _matches(profile_home, record, current):
+                pending.append(record)
+            elif recovery_owner and _adoptable(profile_home, record, current, active_leases):
+                # Keep original admission identity immutable for idempotent sender retries.
                 pending.append(record)
         if not pending:
             return None
         record = min(pending, key=lambda item: (
             item.get("sequence", item["created_at"]), item["delivery_id"]))
-        record.update(status="claimed", claimed_at=time.time_ns())
+        record.update(status="claimed", claimed_at=time.time_ns(),
+                      claim_process={"pid": os.getpid(), "parent_pid": os.getppid()})
+        if record["owner"] != current:
+            record["claimed_owner"] = current
         _write(root / f"{record['delivery_id']}.json", record)
+        log.info("Bot delivery claimed: id=%s session=%s lease=%s pid=%s parent_pid=%s",
+                 record["delivery_id"], current["session_id"], current["lease_id"], os.getpid(), os.getppid())
         return record
 
 
@@ -295,6 +343,7 @@ def complete_delivery(
             raise ValueError("delivery must be claimed before completion")
         record.update(outcome, completed_at=time.time_ns())
         _write(path, record)
+        log.info("Bot delivery terminal: id=%s status=%s pid=%s", key, status, os.getpid())
         return record
 
 

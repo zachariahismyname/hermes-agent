@@ -5178,8 +5178,8 @@ export const en: Translations = {
           body: 'The reply kept repeating the same steps, so Hermes stopped it. Retry, or start a new chat if it happens again.'
         },
         SESSION_NOT_OWNED: {
-          title: 'This chat is open somewhere else',
-          body: 'This chat is currently open in another Hermes window or terminal. Close it there and send your message again, or start a new chat here.'
+          title: 'This chat is currently in use',
+          body: 'Another Hermes session or background agent worker is using this chat. Your message was not accepted. Keep your draft and send it here again when that work finishes.'
         },
         disk_full: {
           title: 'Disk full',
