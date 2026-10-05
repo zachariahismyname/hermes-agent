@@ -104,6 +104,16 @@ def turn_failure_text(stdout: str | None, stderr: str | None) -> str:
     return "\n".join(text.strip() for text in (stdout, stderr) if text and text.strip())
 
 
+def session_ownership_refused(returncode: int, stderr: str | None) -> bool:
+    """Only a pre-turn ownership refusal permits safe transport handoff."""
+    text = stderr or ''
+    marker = next((line.removeprefix('hermes-refusal-reason: ').strip()
+                   for line in text.splitlines() if line.startswith('hermes-refusal-reason: ')), None)
+    # Prose can quote an earlier failure after execution has begun. Only the
+    # CLI's explicit pre-admission marker licenses a second transport.
+    return returncode != 0 and marker == 'SESSION_NOT_OWNED'
+
+
 def result_retry_action(result: Any) -> str:
     """The retry action for a finished IN-PROCESS turn (an ``_run_agent`` result dict).
 

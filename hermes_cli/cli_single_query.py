@@ -200,29 +200,50 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it.
-    Nested Bot Mode notifies bind this session's key (not the dispatcher's) and resume in-process
-    before stdout is printed, so a teammate reply is the quiet run's final answer rather than a
-    stranded receipt."""
+    Nested notifies bind this session's key and resume in-process. A bot-authored
+    invocation retains its original response; later receipts must not replace it
+    with an acknowledgment. Ordinary human one-shot queries retain the historical
+    final-follow-up response behavior."""
     from cli import _emit_interrupted_session_end, _run_kanban_goal_loop_q, _single_query_exit_code, _sync_cli_session_id_from_agent
     from agent.interrupt_compat import _accepts_keyword
     from agent.turn_author import take_turn_author_from_env
     from hermes_cli.quiet_single_query import (
         adopt_unanswered_turn, bind_quiet_session_key, continue_quiet_notify_completions,
         exit_single_query, quiet_notify_linger_seconds, take_turn_report_path, write_turn_report,
+        TURN_REPORT_NONCE_ENV,
     )
 
     author = take_turn_author_from_env()
+    from hermes_cli.quiet_mailbox import QuietMailbox
+    mailbox = QuietMailbox(cli, author)
     # A spawner that bounds only the turn (cron Bot Chat lane) learns the outcome from this
     # report, written before the linger below; popped so tool subprocesses do not inherit it.
     turn_report_path = take_turn_report_path()
+    turn_report_nonce = os.environ.pop(TURN_REPORT_NONCE_ENV, None)
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
-            result = cli.agent.run_conversation(
-                user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
-            )
+            if mailbox.requested_id:
+                # Recovery executes the oldest eligible retained ticket, never
+                # a fresh copy of the runner's query file.
+                recovered = {}
+                def _recover(text, sender):
+                    nonlocal recovered
+                    kwargs = {"turn_author": sender} if sender and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+                    text = mailbox.with_status_note(text, kwargs)
+                    recovered = cli.agent.run_conversation(
+                        user_message=text, conversation_history=cli.conversation_history, **kwargs)
+                    return recovered
+                mailbox.drain_one(_recover)
+                result = recovered or {"final_response": "", "messages": cli.conversation_history}
+            else:
+                run_kwargs = dict(author_kwargs)
+                result = cli.agent.run_conversation(
+                    user_message=mailbox.with_status_note(effective_query, run_kwargs),
+                    conversation_history=cli.conversation_history, **run_kwargs,
+                )
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
             if emitter is not None:
@@ -264,16 +285,20 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 turn_report_path, exit_code=_single_query_exit_code(res),
                 error=str(res.get("error") or "") if isinstance(res, dict) else "agent turn did not run",
                 reply=res.get("final_response", "") if isinstance(res, dict) else str(res),
+                nonce=turn_report_nonce,
             )
 
         _report_turn(result)
         if isinstance(result, dict) and not result.get("failed"):
             history = result.get("messages") or cli.conversation_history
 
-            def _follow_up(text):
+            def _follow_up(text, sender=None):
                 nonlocal history
+                # A completion notification is not another message authored by
+                # the bot that launched the original turn.
+                kwargs = {"turn_author": sender} if sender and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
                 follow = cli.agent.run_conversation(
-                    user_message=text, conversation_history=history, **author_kwargs,
+                    user_message=mailbox.with_status_note(text, kwargs), conversation_history=history, **kwargs,
                 )
                 if isinstance(follow, dict) and follow.get("messages"):
                     history = follow["messages"]
@@ -281,6 +306,11 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 # follow-up must not leave a stale id on the exit line / drain key.
                 _sync_cli_session_id_from_agent(cli)
                 return follow
+
+            def _drain_mailbox():
+                if not mailbox.drain_one(_follow_up):
+                    return None
+                return mailbox.last_result or True
 
             # One shared linger budget for the whole run: the loop below and the later
             # _wait_for_oneshot_background_completions pass must not each wait the full
@@ -294,10 +324,12 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                     _follow_up,
                     owns_event=getattr(cli, "_owns_process_notification", None),
                     linger_budget=quiet_notify_linger_seconds(),
+                    idle_work=_drain_mailbox,
+                    has_pending=mailbox.has_pending,
                 )
             finally:
                 cli._quiet_notify_linger_done = True
-            if isinstance(continued, dict):
+            if isinstance(continued, dict) and not (isinstance(author, dict) and author.get("is_bot")) and not mailbox.requested_id:
                 result = continued
                 # A teammate's reply displaced the answer this run prints; tell the spawner.
                 _report_turn(result)

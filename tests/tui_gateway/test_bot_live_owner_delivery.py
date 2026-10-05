@@ -74,7 +74,7 @@ def test_local_work_blocks_mailbox_claim_without_consuming_envelope(monkeypatch,
     author = {"id": "bot:coder", "name": "coder", "is_bot": True}
     pending = [{"id": "receipt", "message": "imported", "author": author}]
     monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: owner)
-    monkeypatch.setattr(mailbox, "claim_pending_delivery", lambda home, pinned: pending.pop(0))
+    monkeypatch.setattr(mailbox, "claim_pending_delivery", lambda home, pinned, **kwargs: pending.pop(0))
     receipts = []
     monkeypatch.setattr(mailbox, "complete_delivery", lambda *args, **kwargs: receipts.append((args, kwargs)))
     submitted = []

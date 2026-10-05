@@ -72,7 +72,7 @@ def _find_user_turn_by_row_id(history: list, target_row_id: int):
 
 
 def _load_durable_truncation_history(
-    session: dict, fallback_sid: str = "", repair_alternation: bool = True):
+    session: dict, fallback_sid: str = "", repair_alternation: bool = True, exclude_queued: bool = False):
     """Load the durable live-replay transcript, or None when it cannot be proven safe."""
     # Same stale-key hazard as the submit row and the out-of-band probe: a compression rotation moves the
     # live tip off session_key, and this is the load every adoption path replays from — reading the parent
@@ -86,7 +86,8 @@ def _load_durable_truncation_history(
             if not callable(get_conv):
                 return None
             history = get_conv(
-                session_key, repair_alternation=repair_alternation, include_row_ids=True)
+                session_key, repair_alternation=repair_alternation, include_row_ids=True,
+                **({"exclude_queued": True} if exclude_queued else {}))
     except Exception:
         logger.debug(
             "prompt.submit: failed loading durable history for session %s", session_key,

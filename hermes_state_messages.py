@@ -21,7 +21,7 @@ from agent.message_sanitization import _sanitize_surrogates, coalesce_tool_call_
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
-    _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
+    QUEUED_PROMPT_METADATA_KEY, _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
 
@@ -1512,8 +1512,11 @@ class SessionMessagesMixin:
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
                                      include_inactive: bool = False, repair_alternation: bool = False,
                                      include_row_ids: bool = False,
-                                     include_compacted: bool = False) -> List[Dict[str, Any]]:
-        """Load messages in OpenAI format. ``include_compacted`` (deduped display history) is for DISPLAY reads
+                                     include_compacted: bool = False,
+                                     exclude_queued: bool = False) -> List[Dict[str, Any]]:
+        """Load messages in OpenAI format. ``exclude_queued`` drops busy-queue accept rows a turn has not yet
+        admitted (before alternation repair can fold them into another turn), for callers that feed a turn
+        other than the queued prompt's own (out-of-band adoption). ``include_compacted`` (deduped display history) is for DISPLAY reads
         only: the model-fed restore must not regrow what compaction summarized away. ``repair_alternation``
         repairs the loaded list for LIVE REPLAY callers (a durable ``user;user`` pair would re-trigger the
         per-request repair forever), preserving summary markers before repair so derivative context
@@ -1525,7 +1528,7 @@ class SessionMessagesMixin:
             rows = self._dedupe_display_generations(rows)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
-            include_summary_markers=repair_alternation)
+            include_summary_markers=repair_alternation, exclude_queued=exclude_queued)
 
     def _dedupe_replayed_user(self, messages, msg, exact_user_clones) -> Tuple[bool, Any]:
         """Ancestor-lineage dedupe of one decoded user *msg* -> ``(skip, exact_clone_key)``. Rotation
@@ -1551,7 +1554,7 @@ class SessionMessagesMixin:
 
     def _rows_to_conversation(self, rows, *, session_id: str, include_ancestors: bool, repair_alternation: bool,
                               include_row_ids: bool = False,
-                              include_summary_markers: bool = False) -> List[Dict[str, Any]]:
+                              include_summary_markers: bool = False, exclude_queued: bool = False) -> List[Dict[str, Any]]:
         """Decode fetched rows (ordered by id, pre-filtered) into OpenAI format, stable key order. Every dict is
         stamped ``_DB_PERSISTED_MARKER_KEY`` (born durable) so an identity-losing handoff never re-appends the
         transcript on flush. Unaddressed live-replay projections also carry the stored-row CAS digest: if a later rewrite
@@ -1573,6 +1576,10 @@ class SessionMessagesMixin:
         # build's) needs the index, so rows this build wrote never pay for it. Indexed in order: same shadowing.
         unindexed_tool_owners: List[Dict[str, Any]] = []
         for row in rows:
+            if exclude_queued and row["display_metadata"]:
+                metadata = self._decode_display_metadata(row["display_metadata"])
+                if isinstance(metadata, dict) and metadata.get(QUEUED_PROMPT_METADATA_KEY):
+                    continue
             content = self._loaded_view_content(row["role"], self._decode_content(row["content"]))
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).

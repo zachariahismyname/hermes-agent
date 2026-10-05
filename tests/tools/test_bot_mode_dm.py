@@ -507,7 +507,7 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     assert result["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "query-file"
-    assert transport_argv[0] == str(hermes_entry)
+    assert Path(transport_argv[0]) == hermes_entry
     assert transport_argv[1:] == ["-p", "researcher", "chat", "--in", "~", "-c", "Bot Chat",
                                   "--create-if-missing", "-Q"]
 
@@ -517,7 +517,8 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     assert result2["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
-    assert transport_argv == [str(hermes_entry), "-p", "default", "peer", "dm", "spark"]
+    assert Path(transport_argv[0]) == hermes_entry
+    assert transport_argv[1:] == ["-p", "default", "peer", "dm", "spark"]
 
 
 def test_peer_delivery_author_carries_the_sender_hostname_and_local_stays_bare(tmp_path, monkeypatch):
@@ -846,7 +847,7 @@ def test_delivery_runner_keeps_file_for_child_then_unlinks(tmp_path, stdin_file,
 
 
 
-def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
+def test_delivery_runner_preserves_child_failure_and_evidence(tmp_path):
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("secret", encoding="utf-8")
     child = tmp_path / "fail.py"
@@ -862,7 +863,8 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     )
 
     assert returncode == 7
-    assert not dm_file.exists()
+    assert dm_file.exists()
+    assert Path(str(dm_file) + '.pending.json').exists()
 
 
 def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
@@ -874,6 +876,7 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
     child.write_text(
         "import sys\n"
         "print('Session abc already has a live owner (desktop, pid 1).', file=sys.stderr)\n"
+        "print('hermes-refusal-reason: SESSION_NOT_OWNED', file=sys.stderr)\n"
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
@@ -992,7 +995,7 @@ def test_real_delivery_command_round_trip_carries_author(tmp_path):
 
 
 
-def test_delivery_main_maps_launch_exception_to_one_and_unlinks(tmp_path, monkeypatch):
+def test_delivery_main_maps_launch_exception_to_one_and_preserves_evidence(tmp_path, monkeypatch):
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("secret", encoding="utf-8")
 
@@ -1006,7 +1009,7 @@ def test_delivery_main_maps_launch_exception_to_one_and_unlinks(tmp_path, monkey
         )
         == 1
     )
-    assert not dm_file.exists()
+    assert dm_file.exists()
 
 
 def test_local_turn_decodes_utf8_reply_without_locale_default(tmp_path, monkeypatch, capsys):
@@ -1203,9 +1206,8 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
         bot_mode_dm._dm_dir()
 
 
-def test_cleanup_sweeps_stale_live_intents_and_keeps_fresh_ones(tmp_path, monkeypatch):
-    """``<dm file>.live.json`` holds the DM plaintext and outlives its runner for retries; the
-    housekeeping sweep must reap the orphans like it reaps the dm files themselves."""
+def test_cleanup_preserves_live_intents_regardless_of_age(tmp_path, monkeypatch):
+    """Age is not proof of settlement; pending or unreadable intents must survive restart."""
     import os
 
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
@@ -1215,8 +1217,8 @@ def test_cleanup_sweeps_stale_live_intents_and_keeps_fresh_ones(tmp_path, monkey
     fresh = tmp_path / "dm-new.txt.live.json"
     fresh.write_text("{}", encoding="utf-8")
 
-    assert bot_mode_dm.cleanup_bot_dm_cache() >= 1
-    assert not stale.exists()
+    assert bot_mode_dm.cleanup_bot_dm_cache() == 0
+    assert stale.exists()
     assert fresh.exists()
 
 
@@ -1312,17 +1314,28 @@ def test_ack_names_poll_return_path_when_session_cannot_receive_completions(tmp_
     assert "proc_np1" in result["detail"]
 
 
-def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive_completions(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sender_consumes_mailbox", [False, True])
+def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive_completions(
+        tmp_path, monkeypatch, sender_consumes_mailbox):
     """#101142 sibling: a live-owner (Desktop) target still runs the same tracked runner whose
     stdout carries the reply. On a non-push sender the live-owner ack must propagate
-    ``reply_delivery="poll"`` and the wait instruction instead of 'finish your turn'."""
+    ``reply_delivery="poll"`` and the wait instruction instead of 'finish your turn'.
+
+    A correlated receipt is a return path ONLY when the sender's own conversation is
+    its home's advertised Bot Chat mailbox consumer (Desktop/TUI or quiet CLI). Then the runner starts
+    without a completion promise and no poll applies. Any other sender (e.g. an interactive CLI owner,
+    whose receipts cannot be queued while it holds the chat) keeps the upstream poll contract and
+    gets no outbox index, so the reply cannot also arrive later as a duplicate receipt.
+    """
     from tools import bot_live_delivery as live
     import tools.terminal_tool as terminal_tool_module
 
     home = _managed_home(tmp_path)
     target = home / "profiles" / "researcher"
     owner = dict(profile_home=str(target), session_id="bot", lease_id="lease", live_session_id="live")
-    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: owner if Path(h) == target else None)
+    sender = dict(profile_home=str(home), session_id="sess-1", lease_id="sender", live_session_id="sender-live")
+    owners = {target: owner, **({home: sender} if sender_consumes_mailbox else {})}
+    monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: owners.get(Path(h)))
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
     monkeypatch.setattr(terminal_tool_module, "terminal_tool", lambda command, **kw: json.dumps({
         "output": "Background process started", "session_id": "proc_np2", "notify_on_complete": False}))
@@ -1330,8 +1343,15 @@ def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive
     result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
     assert result["process_id"] == "proc_np2"
-    assert result["reply_delivery"] == "poll"
-    assert "proc_np2" in result["detail"]
+    index = home / "runtime" / "bot_delivery_outbox" / f"{result['delivery_id']}.json"
+    if sender_consumes_mailbox:
+        assert result["reply_delivery"] == "notification"
+        assert "receipt" in result["detail"] and "wait" not in result["detail"].replace("Do NOT wait", "")
+        assert index.is_file()
+    else:
+        assert result["reply_delivery"] == "poll"
+        assert "proc_np2" in result["detail"]
+        assert not index.exists()
 
 
 def test_poll_reply_is_persisted_as_a_delivery_row_when_the_runner_exits(tmp_path, monkeypatch):

@@ -1871,6 +1871,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def wait_for_pending_completions(
         self, task_id: Optional[str] = None, *, timeout: float | None = None, poll_interval: float = 1.0,
+        warn_on_timeout: bool = True,
     ) -> dict:
         """Bounded linger for ``notify_on_complete`` background processes at one-shot exit.
         A one-shot CLI run (``hermes -q/-Q/-z``) exits when its turn ends; a background
@@ -1881,6 +1882,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         process; ``timeout=None`` reads ``terminal.oneshot_completion_wait_seconds`` (``<= 0``
         disables). Each pass re-reconciles child state so an orphaned-pipe exit can't wedge
         the linger. Returns ``{"waited", "completed", "timed_out"}`` id lists.
+        Polling callers set ``warn_on_timeout=False`` and report once at their
+        overall deadline; a polling slice is not an imminent parent exit.
 
         Bot Mode handoff REPLIES are the visible casualty (#90879): a recipient invoked as ``hermes -p <bot>
         chat -Q --query-file ...`` dispatches its reply via ``message_agent`` / ``bot_relay`` exactly this
@@ -1903,7 +1906,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if not pending or timeout <= 0:
             return result
         result["waited"] = [s.id for s in pending]
-        logger.info(
+        (logger.info if warn_on_timeout else logger.debug)(
             "One-shot exit lingering (bounded %ss) for %d notify_on_complete "
             "background process(es): %s",
             timeout, len(pending), ", ".join(s.id for s in pending))
@@ -1944,7 +1947,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 # teardown (session flush, end_session) that follows.
                 interrupted = True
             result["completed" if session._completion_event.is_set() else "timed_out"].append(session.id)
-        if result["timed_out"]:
+        if result["timed_out"] and warn_on_timeout:
             logger.warning(
                 "One-shot exit linger timed out after %ss with %d background "
                 "process(es) still running: %s — they may be killed when this "

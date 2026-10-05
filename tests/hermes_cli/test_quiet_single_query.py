@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+import pytest
 
 import cli
 from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -78,7 +79,8 @@ def test_rerun_adopts_the_dm_behind_the_failed_attempts_tool_scaffolding(monkeyp
     assert agent._pending_cli_user_message is tail and tail[_DB_PERSISTED_MARKER] is True
 
 
-def test_turn_report_is_written_before_the_exit_linger_and_the_path_is_not_inherited(monkeypatch, tmp_path):
+@pytest.mark.parametrize('nonce', [None, 'current-invocation'])
+def test_turn_report_is_written_before_the_exit_linger_and_the_path_is_not_inherited(monkeypatch, tmp_path, nonce):
     """A spawner that bounds only the turn (cron Bot Chat lane, #113608) reads the outcome from
     HERMES_QUIET_TURN_REPORT_FILE: written the moment the turn ends — before the one-shot exit
     linger — stamped with this pid, and the variable is popped before the turn spawns anything."""
@@ -88,10 +90,15 @@ def test_turn_report_is_written_before_the_exit_linger_and_the_path_is_not_inher
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     report = tmp_path / "turn.json"
     monkeypatch.setenv(qsq.TURN_REPORT_FILE_ENV, str(report))
+    if nonce is not None:
+        monkeypatch.setenv(qsq.TURN_REPORT_NONCE_ENV, nonce)
+    else:
+        monkeypatch.delenv(qsq.TURN_REPORT_NONCE_ENV, raising=False)
     seen = {}
 
     def run_conversation(**kwargs):
         seen["env_during_turn"] = os.environ.get(qsq.TURN_REPORT_FILE_ENV)
+        seen["nonce_during_turn"] = os.environ.get(qsq.TURN_REPORT_NONCE_ENV)
         seen["report_during_turn"] = report.exists()
         return {"final_response": "ok"}
 
@@ -106,7 +113,13 @@ def test_turn_report_is_written_before_the_exit_linger_and_the_path_is_not_inher
     except SystemExit as exc:
         assert exc.code == 0
     assert seen["env_during_turn"] is None and seen["report_during_turn"] is False
-    assert seen["report_at_linger"] == {"pid": os.getpid(), "exit_code": 0, "error": "", "reply": "ok"}
+    assert seen['nonce_during_turn'] is None
+    expected = {"pid": os.getpid(), "exit_code": 0, "error": "", "reply": "ok"}
+    if nonce is not None:
+        expected['nonce'] = nonce
+        assert qsq.read_turn_report(str(report), os.getpid() + 1, nonce=nonce) == expected
+    assert seen["report_at_linger"] == expected
+    assert qsq.read_turn_report(str(report), os.getpid(), nonce='different-invocation') is None
     # Another process's record is not this child's report.
     assert qsq.read_turn_report(str(report), os.getpid() + 1) is None
 

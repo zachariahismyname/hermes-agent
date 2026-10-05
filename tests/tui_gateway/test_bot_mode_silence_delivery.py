@@ -69,3 +69,22 @@ def test_live_bot_chat_stream_holds_back_partial_silence_marker(monkeypatch):
     assert _run("NO_REPLY", ["NO_", "REPLY"]) == ([], "")
     assert _run("NO way, here is the answer.", ["NO", " way,", " here is the answer."]) == (
         ["NO way,", " here is the answer."], "NO way, here is the answer.")
+
+
+def test_terminal_receipt_marks_only_exact_successful_silence(monkeypatch):
+    """The receipt must tell silence from an empty turn: both deliver "" in Bot Chat."""
+    monkeypatch.setattr(srv, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(srv, "render_message", lambda _text, _cols: None)
+    monkeypatch.setattr(srv, "_clear_inflight_turn", lambda _session: None)
+    monkeypatch.setattr(srv, "_fail_inflight_turn", lambda *_a, **_kw: None)
+    monkeypatch.setattr(srv, "_retire_turn_marker", lambda *_a: None)
+    session = {"pending_title": None, "session_key": "k", "history_lock": contextlib.nullcontext(),
+               "agent": SimpleNamespace(_session_title_hint="Bot Chat")}
+    receipts = []
+    for result in ({"final_response": "NO_REPLY"}, {"final_response": ""},
+                   {"final_response": "NO_REPLY", "error": "provider failed", "failed": True}):
+        st = _turn(result)
+        st.terminal_callback = receipts.append
+        srv._complete_turn_payload(session, st, None, 80)
+    assert [(r["status"], r["text"], r.get("silent")) for r in receipts] == [
+        ("settled", "", True), ("settled", "", None), ("failed", "NO_REPLY", None)]

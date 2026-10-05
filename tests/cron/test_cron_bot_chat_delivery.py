@@ -235,8 +235,9 @@ def test_turn_report_books_the_delivery_while_the_child_still_lingers(tmp_path):
     report = tmp_path / "turn.json"
     child = textwrap.dedent("""
         import os, time
-        from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV, write_turn_report
-        write_turn_report(os.environ.pop(TURN_REPORT_FILE_ENV), exit_code=0)
+        from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV, TURN_REPORT_NONCE_ENV, write_turn_report
+        write_turn_report(os.environ.pop(TURN_REPORT_FILE_ENV), exit_code=0,
+                          nonce=os.environ.pop(TURN_REPORT_NONCE_ENV))
         time.sleep(30)
         """)
     procs, real_popen = [], subprocess.Popen
@@ -273,9 +274,10 @@ def test_delivery_child_runs_in_the_target_home_not_the_schedulers_cwd(tmp_path,
     gone.rmdir()
     child = textwrap.dedent("""
         import os, sys
-        from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV, write_turn_report
+        from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV, TURN_REPORT_NONCE_ENV, write_turn_report
         sys.stdout.write(os.getcwd())
-        write_turn_report(os.environ.pop(TURN_REPORT_FILE_ENV), exit_code=0)
+        write_turn_report(os.environ.pop(TURN_REPORT_FILE_ENV), exit_code=0,
+                          nonce=os.environ.pop(TURN_REPORT_NONCE_ENV))
         """)
     env = {**_child_env(), "HERMES_HOME": str(home), TURN_REPORT_FILE_ENV: str(report)}
     result = sched_delivery._run_bot_chat_turn([sys.executable, "-c", child], env, str(report), timeout=30)

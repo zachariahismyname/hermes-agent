@@ -35,6 +35,16 @@ def homes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(launch))
     return launch, served
 
+
+def test_idle_host_sweeps_delivery_indexes_without_open_sessions(homes, monkeypatch):
+    from tools import bot_delivery_outbox
+    launch, _ = homes
+    seen = []
+    monkeypatch.setattr(tui_server, "_sessions", {})
+    monkeypatch.setattr(bot_delivery_outbox, "sweep_install_outgoing", lambda home: seen.append(home))
+    tui_server._reap_idle_sessions()
+    assert seen == [launch]
+
 def _install_session(monkeypatch, session):
     monkeypatch.setattr(tui_server, "_sessions", {"sid": session}, raising=False)
     monkeypatch.setattr(tui_server, "_sessions_lock", threading.RLock(), raising=False)

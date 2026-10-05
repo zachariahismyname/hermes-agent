@@ -5628,8 +5628,8 @@ export const frOverrides = {
           body: 'La réponse répétait les mêmes étapes ; Hermes l’a donc arrêtée. Réessayez ou démarrez une nouvelle conversation.'
         },
         SESSION_NOT_OWNED: {
-          title: 'Cette conversation est ouverte ailleurs',
-          body: 'Cette conversation est déjà ouverte dans une autre fenêtre Hermes ou un terminal. Fermez-la là-bas puis réessayez, ou démarrez-en une nouvelle ici.'
+          title: 'Cette conversation est en cours d’utilisation',
+          body: 'Une autre session Hermes ou un agent en arrière-plan utilise cette conversation. Votre message n’a pas été accepté. Gardez votre brouillon et renvoyez-le ici une fois ce travail terminé.'
         },
         disk_full: {
           title: 'Disque plein',

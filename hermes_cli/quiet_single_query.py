@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -21,6 +22,9 @@ from typing import Any, Callable, MutableMapping
 
 # Nested A→B→C is one extra turn; this caps a runaway message_agent chain.
 _MAX_QUIET_NOTIFY_ROUNDS = 8
+# Mailbox-responsive linger slice: how long one completion wait may block before idle work runs.
+_IDLE_POLL_SECONDS = 0.5
+logger = logging.getLogger(__name__)
 
 # Last line a Kanban worker leaves in its own log: ``[kanban-worker-exit] rc=<code>``. A per-tick
 # ``hermes kanban dispatch`` process never reaped the worker, so ``os.waitpid`` cannot tell it how
@@ -47,6 +51,9 @@ def exit_single_query(code: int) -> None:
 # contract as HERMES_TURN_AUTHOR): nothing the turn spawns inherits it, and a nested one-shot
 # never writes over its host's report — the record also carries the writer's pid.
 TURN_REPORT_FILE_ENV = "HERMES_QUIET_TURN_REPORT_FILE"
+# Per-invocation transport identity, consumed before tools can inherit it. A
+# Windows venv/CLI launcher PID is not necessarily the reporting Python PID.
+TURN_REPORT_NONCE_ENV = "HERMES_QUIET_TURN_REPORT_NONCE"
 
 
 def take_turn_report_path(environ: MutableMapping[str, str] = os.environ) -> str | None:
@@ -54,7 +61,8 @@ def take_turn_report_path(environ: MutableMapping[str, str] = os.environ) -> str
     return environ.pop(TURN_REPORT_FILE_ENV, None) or None
 
 
-def write_turn_report(path: str | None, *, exit_code: int, error: str = "", reply: str = "") -> None:
+def write_turn_report(path: str | None, *, exit_code: int, error: str = "", reply: str = "",
+                      nonce: str | None = None) -> None:
     """Atomically record ``{pid, exit_code, error, reply}`` at *path*; a no-op without a path. Never
     raises: the report is the spawner's convenience, the turn itself is already persisted. ``reply``
     is what the run will print — a spawner booking a lingering child from its report relays it."""
@@ -63,19 +71,26 @@ def write_turn_report(path: str | None, *, exit_code: int, error: str = "", repl
     from utils import atomic_json_write
 
     record = {"pid": os.getpid(), "exit_code": int(exit_code), "error": str(error or ""), "reply": str(reply or "")}
+    if nonce:
+        record["nonce"] = nonce
     # 0600 from creation: the record now carries the turn's answer, like the 0600 query file beside it.
     with contextlib.suppress(Exception):
         atomic_json_write(path, record, indent=None, mode=0o600)
 
 
-def read_turn_report(path: str, pid: int) -> dict | None:
+def read_turn_report(path: str, pid: int, *, nonce: str | None = None) -> dict | None:
     """The child's turn report, or None while absent, unreadable, or written by another process."""
     try:
         with open(path, encoding="utf-8-sig") as fh:
             record = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict) or record.get("pid") != pid:
+    if not isinstance(record, dict):
+        return None
+    # With a nonce, stale reports from a previous attempt (even the same PID)
+    # fail closed. Legacy direct callers retain their exact-PID contract.
+    matches = record.get("nonce") == nonce if nonce is not None else record.get("pid") == pid
+    if not matches:
         return None
     return record
 
@@ -113,12 +128,16 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
     locale codec, so the locale default stays correct there (#66566).
     """
     from hermes_cli._subprocess_compat import windows_hide_flags
+    import uuid
+
+    nonce = uuid.uuid4().hex
 
     if encoding is None and sys.platform == "win32":
         encoding = "utf-8"
     proc = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding=encoding, errors="replace", env={**env, TURN_REPORT_FILE_ENV: report_path},
+        encoding=encoding, errors="replace", env={**env, TURN_REPORT_FILE_ENV: report_path,
+                                                  TURN_REPORT_NONCE_ENV: nonce},
         cwd=cwd, creationflags=windows_hide_flags())
     streams: dict = {}
 
@@ -136,7 +155,7 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
         if report is not None and exit_grace is not None:
             break
         # Re-read while waiting for the cap: a follow-up turn rewrites the report with its answer.
-        report = read_turn_report(report_path, proc.pid) or report
+        report = read_turn_report(report_path, proc.pid, nonce=nonce) or report
         if time.monotonic() >= deadline:
             if report is not None:
                 break
@@ -146,7 +165,7 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
             # in the window between the last report check and the kill landing. Re-read once:
             # a report that appeared means the turn completed — book it instead of
             # misreporting a delivered turn as a timeout (and never re-notifying).
-            report = read_turn_report(report_path, proc.pid)
+            report = read_turn_report(report_path, proc.pid, nonce=nonce)
             if report is not None:
                 break
             raise subprocess.TimeoutExpired(argv, timeout)
@@ -196,6 +215,8 @@ def continue_quiet_notify_completions(
     owns_event=None,
     max_rounds: int = _MAX_QUIET_NOTIFY_ROUNDS,
     linger_budget: float | None = None,
+    idle_work=None,
+    has_pending=None,
 ) -> Any:
     """Linger for ``notify_on_complete`` work, then run owned completion texts as follow-up turns.
 
@@ -213,8 +234,20 @@ def continue_quiet_notify_completions(
     if linger_budget is None:
         linger_budget = quiet_notify_linger_seconds()
     deadline = time.monotonic() + max(float(linger_budget), 0.0)
-    for _ in range(max_rounds):
-        wait = process_registry.wait_for_pending_completions(None, timeout=max(deadline - time.monotonic(), 0.0))
+    rounds = 0
+    while rounds < max_rounds:
+        idle_result = idle_work() if idle_work is not None else None
+        if idle_result:
+            rounds += 1
+            if isinstance(idle_result, dict):
+                last = idle_result
+            continue
+        slice_started = time.monotonic()
+        remaining = max(deadline - slice_started, 0.0)
+        wait_options = {"timeout": remaining}
+        if idle_work is not None:
+            wait_options = {"timeout": min(remaining, _IDLE_POLL_SECONDS), "warn_on_timeout": False}
+        wait = process_registry.wait_for_pending_completions(None, **wait_options)
         drained = []
         for event, text in process_registry.drain_notifications(session_key=key, owns_event=owns_event):
             # Durable async_delegation events carry a delivery ledger: without the
@@ -232,15 +265,30 @@ def continue_quiet_notify_completions(
         # async_delegation results. Keep everything that rendered.
         texts = [text for _event, text in drained if text]
         if texts:
+            rounds += 1
             follow = run_turn("\n\n".join(texts))
             # Same admission rule as the interactive CLI turn: a wake made ONLY of automatic
             # diagnostics (early failure / watch notices) still runs, but under suppression its
             # reply never displaces the requested one-shot answer on stdout.
             if not _diagnostic_only_wake_muted([event for event, text in drained if text]):
                 last = follow
+        if wait.get("timed_out") and idle_work is not None and time.monotonic() < deadline:
+            # A slice can report timed_out at once (pending interrupt, vanished detached
+            # session); keep the mailbox poll at its cadence instead of spinning on disk locks.
+            if not texts and (pause := _IDLE_POLL_SECONDS - (time.monotonic() - slice_started)) > 0:
+                time.sleep(min(pause, max(deadline - time.monotonic(), 0.0)))
+            continue
         if wait.get("timed_out"):
+            if idle_work is not None:
+                logger.warning(
+                    "One-shot exit linger timed out after %ss with %d background "
+                    "process(es) still running: %s — they may be killed when this "
+                    "process exits.", linger_budget, len(wait["timed_out"]), ", ".join(wait["timed_out"]))
             break
         if not texts:
+            if has_pending is not None and has_pending() and time.monotonic() < deadline:
+                time.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
+                continue
             return last
     return last
 
